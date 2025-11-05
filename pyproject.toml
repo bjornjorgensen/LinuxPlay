@@ -25,7 +25,6 @@ classifiers = [
 ]
 
 dependencies = [
-    "PyQt5>=5.15.0",
     "PyOpenGL>=3.1.6",
     "PyOpenGL-accelerate>=3.1.6",
     "av>=16.0.0",
@@ -116,7 +115,9 @@ unfixable = []
 
 [tool.ruff.lint.per-file-ignores]
 "__init__.py" = ["F401"]
-"src/linuxplay/client.py" = ["F403", "F405"]  # OpenGL star imports are intentional
+"src/linuxplay/client.py" = ["F403", "F405", "PLC0415"]  # OpenGL star imports, lazy crypto imports
+"src/linuxplay/host.py" = ["PLC0415", "ERA001"]  # Lazy crypto imports, legacy code comments
+"tests/test_*.py" = ["PLC0415"]  # Allow imports in test methods for isolation
 
 [tool.ruff.lint.isort]
 known-first-party = ["linuxplay"]

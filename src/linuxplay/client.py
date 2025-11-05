@@ -18,16 +18,15 @@ import subprocess
 import sys
 import threading
 import time
+import tkinter as tk
 from pathlib import Path
 from queue import Queue
+from tkinter import messagebox, simpledialog
 
 import av
 import numpy as np
 import psutil
 from OpenGL.GL import *
-from PyQt5.QtCore import Qt, QThread, QTimer, pyqtSignal
-from PyQt5.QtGui import QSurfaceFormat
-from PyQt5.QtWidgets import QApplication, QInputDialog, QLineEdit, QMainWindow, QMessageBox, QOpenGLWidget
 
 
 try:
@@ -43,6 +42,42 @@ try:
     HAVE_PYNVML = True
 except ImportError:
     HAVE_PYNVML = False
+
+
+# Tkinter dialog helpers
+def _show_error(title: str, message: str):
+    """Show error dialog (thread-safe)."""
+    try:
+        root = tk.Tk()
+        root.withdraw()
+        messagebox.showerror(title, message, parent=root)
+        root.destroy()
+    except Exception:
+        logging.error(f"{title}: {message}")
+
+
+def _show_info(title: str, message: str):
+    """Show info dialog (thread-safe)."""
+    try:
+        root = tk.Tk()
+        root.withdraw()
+        messagebox.showinfo(title, message, parent=root)
+        root.destroy()
+    except Exception:
+        logging.info(f"{title}: {message}")
+
+
+def _ask_pin(title: str = "Enter Host PIN", prompt: str = "6-digit PIN (rotates every 30s):") -> str:
+    """Show PIN input dialog."""
+    try:
+        root = tk.Tk()
+        root.withdraw()
+        result = simpledialog.askstring(title, prompt, show="*", parent=root)
+        root.destroy()
+        return (result or "").strip()
+    except Exception:
+        logging.error("PIN dialog failed")
+        return ""
 
 
 DEFAULT_UDP_PORT = 5000
@@ -191,26 +226,355 @@ def _read_pem_cert_fingerprint(pem_path: str) -> str:
         return ""
 
 
+def _ensure_client_keypair(key_path: Path) -> bool:
+    """
+    Generate client RSA keypair if not exists.
+    Returns True if newly generated, False if already exists.
+    Private key stays on client - NEVER transmitted.
+    """
+    if key_path.exists():
+        logging.debug("Client keypair already exists at %s", key_path)
+        return False
+
+    try:
+        from cryptography.hazmat.primitives import serialization
+        from cryptography.hazmat.primitives.asymmetric import rsa
+
+        logging.info("Generating client RSA keypair (4096-bit)...")
+        private_key = rsa.generate_private_key(
+            public_exponent=65537,
+            key_size=4096,
+        )
+
+        # Ensure directory exists
+        key_path.parent.mkdir(parents=True, exist_ok=True)
+
+        # Write private key with secure permissions
+        key_pem = private_key.private_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PrivateFormat.PKCS8,
+            encryption_algorithm=serialization.NoEncryption(),
+        )
+        key_path.write_bytes(key_pem)
+        key_path.chmod(0o600)  # Owner read/write only
+
+        logging.info("Client keypair generated and saved to %s (permissions: 0600)", key_path)
+        return True
+    except Exception as e:
+        logging.error("Failed to generate client keypair: %s", e)
+        return False
+
+
+def _generate_csr(private_key_path: Path, client_id: str) -> bytes:
+    """
+    Generate Certificate Signing Request.
+    Returns CSR in PEM format.
+    """
+    try:
+        from cryptography import x509
+        from cryptography.hazmat.primitives import hashes, serialization
+        from cryptography.x509.oid import NameOID
+
+        # Load private key
+        key_pem = private_key_path.read_bytes()
+        private_key = serialization.load_pem_private_key(key_pem, password=None)
+
+        # Create subject name
+        subject = x509.Name(
+            [
+                x509.NameAttribute(NameOID.COMMON_NAME, client_id),
+            ]
+        )
+
+        # Build and sign CSR
+        csr = x509.CertificateSigningRequestBuilder().subject_name(subject).sign(private_key, hashes.SHA256())
+
+        return csr.public_bytes(serialization.Encoding.PEM)
+    except Exception as e:
+        logging.error("Failed to generate CSR: %s", e)
+        return b""
+
+
+def _validate_host_ca_fingerprint(ca_cert_pem: bytes, host_ip: str) -> bool:
+    """
+    Validate host CA fingerprint using Trust On First Use (TOFU).
+    On first connection, pins the fingerprint.
+    On subsequent connections, verifies it matches (detects MITM).
+    """
+    try:
+        from cryptography import x509
+        from cryptography.hazmat.primitives import hashes
+
+        ca_cert = x509.load_pem_x509_certificate(ca_cert_pem)
+        fingerprint = ca_cert.fingerprint(hashes.SHA256()).hex()
+
+        pinned_file = Path.home() / ".linuxplay" / "pinned_hosts.json"
+
+        # Load existing pins
+        pinned = {}
+        if pinned_file.exists():
+            try:
+                with pinned_file.open() as f:
+                    pinned = json.load(f)
+            except Exception as e:
+                logging.warning("Failed to load pinned hosts: %s", e)
+
+        # Check if host is already pinned
+        if host_ip in pinned:
+            if pinned[host_ip] != fingerprint:
+                logging.error(
+                    "Host CA fingerprint mismatch for %s! Expected %s, got %s. Possible MITM attack.",
+                    host_ip,
+                    pinned[host_ip][:16],
+                    fingerprint[:16],
+                )
+                return False
+            logging.info("Host CA fingerprint verified for %s (pinned)", host_ip)
+            return True
+
+        # Pin on first use
+        pinned[host_ip] = fingerprint
+        pinned_file.parent.mkdir(parents=True, exist_ok=True)
+        with pinned_file.open("w") as f:
+            json.dump(pinned, f, indent=2)
+
+        logging.info("Host CA fingerprint pinned for %s: %s...", host_ip, fingerprint[:16])
+        return True
+    except Exception as e:
+        logging.error("Failed to validate host CA fingerprint: %s", e)
+        return False
+
+
+def _sign_challenge(private_key_path: Path, challenge: bytes) -> bytes:
+    """
+    Sign challenge with client's private key.
+    Returns signature bytes.
+    """
+    try:
+        from cryptography.hazmat.primitives import hashes, serialization
+        from cryptography.hazmat.primitives.asymmetric import padding
+
+        # Load private key
+        key_pem = private_key_path.read_bytes()
+        private_key = serialization.load_pem_private_key(key_pem, password=None)
+
+        # Sign challenge
+        return private_key.sign(
+            challenge,
+            padding.PSS(mgf=padding.MGF1(hashes.SHA256()), salt_length=padding.PSS.MAX_LENGTH),
+            hashes.SHA256(),
+        )
+
+    except Exception as e:
+        logging.error("Failed to sign challenge: %s", e)
+        return b""
+
+
 def tcp_handshake_client(host_ip, pin=None):
+    """
+    Authenticate with host using new secure protocol.
+
+    Priority order:
+    1. NEW: Challenge-response with existing cert (signature verification)
+    2. NEW: CSR submission with PIN (first-time secure auth)
+    3. LEGACY: Fingerprint-only (deprecated, for old hosts)
+    4. LEGACY: PIN-only (deprecated, insecure)
+    """
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.settimeout(5)
+    sock.settimeout(10)  # Increased timeout for crypto operations
+
     try:
         logging.info("Handshake to %s:%s", host_ip, TCP_HANDSHAKE_PORT)
         sock.connect((host_ip, TCP_HANDSHAKE_PORT))
+
+        # Determine client paths
         try:
-            here = Path(__file__).resolve().parent
-            cert_path = here / "client_cert.pem"
-            key_path = here / "client_key.pem"
+            client_dir = Path.home() / ".linuxplay"
         except Exception:
-            cert_path = Path("client_cert.pem")
-            key_path = Path("client_key.pem")
+            client_dir = Path.home() / ".linuxplay"
+
+        cert_path = client_dir / "client_cert.pem"
+        key_path = client_dir / "client_key.pem"
+        ca_path = client_dir / "host_ca.pem"
+
+        # Ensure client has keypair
+        _ensure_client_keypair(key_path)
+
+        # PATH 1: NEW SECURE - Challenge-response with existing cert
+        if cert_path.exists() and key_path.exists() and ca_path.exists():
+            logging.info("[AUTH] Attempting secure challenge-response authentication")
+            try:
+                # Validate host CA fingerprint (TOFU)
+                ca_pem = ca_path.read_bytes()
+                if not _validate_host_ca_fingerprint(ca_pem, host_ip):
+                    logging.error("[AUTH] Host CA fingerprint validation failed - possible MITM!")
+                    _show_error(
+                        "Security Error",
+                        f"Host CA fingerprint mismatch for {host_ip}!\nPossible Man-in-the-Middle attack.",
+                    )
+                    sock.close()
+                    return (False, None)
+
+                # Try new challenge-response protocol
+                fp_hex = _read_pem_cert_fingerprint(cert_path)
+                sock.sendall(f"AUTH CERT:{fp_hex}".encode())
+                resp = sock.recv(2048).decode("utf-8", errors="replace").strip()
+
+                if resp.startswith("CHALLENGE:"):
+                    challenge_b64 = resp[10:]
+                    challenge = base64.b64decode(challenge_b64)
+
+                    # Sign challenge
+                    signature = _sign_challenge(key_path, challenge)
+                    if not signature:
+                        raise Exception("Failed to sign challenge")
+
+                    # Send signature
+                    sig_b64 = base64.b64encode(signature).decode()
+                    sock.sendall(f"SIGNATURE:{sig_b64}".encode())
+
+                    # Receive result
+                    final_resp = sock.recv(2048).decode("utf-8", errors="replace").strip()
+
+                    if final_resp.startswith("OK:"):
+                        parts = final_resp.split(":", 2)
+                        host_encoder = parts[1].strip()
+                        monitor_info = parts[2].strip() if len(parts) > 2 else DEFAULT_RESOLUTION
+                        sock.close()
+                        CLIENT_STATE["connected"] = True
+                        CLIENT_STATE["last_heartbeat"] = time.time()
+                        logging.info("[AUTH] ✓ Authenticated via challenge-response (SECURE)")
+                        return (True, (host_encoder, monitor_info))
+
+                    if final_resp.startswith("FAIL:DEPRECATED"):
+                        logging.warning("[AUTH] Host requires upgrade to new protocol")
+                        # Fall through to legacy
+                    else:
+                        logging.warning("[AUTH] Challenge-response failed: %s", final_resp)
+
+                elif resp.startswith("FAIL:DEPRECATED"):
+                    logging.warning("[AUTH] Host requires protocol upgrade - falling back to legacy")
+                    # Fall through to legacy fingerprint auth
+
+                elif resp.startswith("BUSY"):
+                    logging.error("Host is already in a session")
+                    _show_error("Host Busy", "The host is already connected to another client.")
+                    sock.close()
+                    return (False, None)
+
+            except Exception as e:
+                logging.debug("[AUTH] Secure auth failed (%s), trying legacy", e)
+                # Reconnect for legacy attempt
+                with contextlib.suppress(Exception):
+                    sock.close()
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.settimeout(10)
+                sock.connect((host_ip, TCP_HANDSHAKE_PORT))
+
+        # PATH 2: NEW SECURE - CSR submission (first time with this client)
+        if not cert_path.exists() or not ca_path.exists():
+            logging.info("[AUTH] No certificates found - using CSR flow (first-time secure auth)")
+
+            # Get PIN
+            code = (pin or "").strip()
+            if not code or len(code) != 6 or not code.isdigit():
+                code = _ask_pin()
+                if not code or not code.isdigit() or len(code) != 6:
+                    sock.close()
+                    logging.error("PIN entry cancelled or invalid")
+                    _show_error("Invalid PIN", "PIN entry was cancelled or invalid.")
+                    return (False, None)
+
+            try:
+                # Send CSR request with PIN
+                sock.sendall(f"AUTH CSR {code}".encode())
+                resp = sock.recv(2048).decode("utf-8", errors="replace").strip()
+
+                if resp == "SENDCSR":
+                    # Generate and send CSR
+                    client_id = f"linuxplay-{socket.gethostname()}"
+                    csr_pem = _generate_csr(key_path, client_id)
+                    if not csr_pem:
+                        raise Exception("Failed to generate CSR")
+
+                    csr_b64 = base64.b64encode(csr_pem).decode()
+                    sock.sendall(f"CSR:{csr_b64}".encode())
+
+                    # Receive certificate
+                    cert_resp = sock.recv(16384).decode("utf-8", errors="replace").strip()
+
+                    if cert_resp.startswith("CERT:"):
+                        cert_data = cert_resp[5:]
+                        parts = cert_data.split("|")
+                        if len(parts) != 2:
+                            raise Exception("Invalid certificate response")
+
+                        cert_b64, ca_b64 = parts
+                        cert_pem = base64.b64decode(cert_b64)
+                        ca_pem = base64.b64decode(ca_b64)
+
+                        # Save certificates
+                        client_dir.mkdir(parents=True, exist_ok=True)
+                        cert_path.write_bytes(cert_pem)
+                        ca_path.write_bytes(ca_pem)
+                        cert_path.chmod(0o600)
+                        ca_path.chmod(0o600)
+
+                        # Validate and pin CA
+                        if not _validate_host_ca_fingerprint(ca_pem, host_ip):
+                            logging.error("[AUTH] CA fingerprint validation failed after issuance!")
+                            sock.close()
+                            return (False, None)
+
+                        # Receive final OK
+                        final_resp = sock.recv(2048).decode("utf-8", errors="replace").strip()
+                        if final_resp.startswith("OK:"):
+                            parts = final_resp.split(":", 2)
+                            host_encoder = parts[1].strip()
+                            monitor_info = parts[2].strip() if len(parts) > 2 else DEFAULT_RESOLUTION
+                            sock.close()
+                            CLIENT_STATE["connected"] = True
+                            CLIENT_STATE["last_heartbeat"] = time.time()
+                            logging.info("[AUTH] ✓ Authenticated via CSR (SECURE - first time)")
+                            _show_info(
+                                "Certificate Issued",
+                                "Client certificate issued successfully!\nFuture connections will use secure authentication.",
+                            )
+                            return (True, (host_encoder, monitor_info))
+
+                    logging.error("[AUTH] CSR flow failed: %s", cert_resp)
+
+                elif resp.startswith("FAIL:BADPIN"):
+                    logging.error("Incorrect or expired PIN")
+                    _show_error("Authentication Failed", "The PIN is incorrect or expired.")
+                    sock.close()
+                    return (False, None)
+
+                elif resp.startswith("FAIL:RATELIMIT"):
+                    logging.error("Rate limited: %s", resp)
+                    _show_error("Rate Limited", "Too many failed attempts. Please wait.")
+                    sock.close()
+                    return (False, None)
+
+                elif resp.startswith("BUSY"):
+                    logging.error("Host is already in a session")
+                    _show_error("Host Busy", "The host is already connected to another client.")
+                    sock.close()
+                    return (False, None)
+
+            except Exception as e:
+                logging.error("[AUTH] CSR flow failed: %s", e)
+                # Fall through to legacy
+
+        # PATH 3: LEGACY - Fingerprint-only (deprecated)
         if cert_path.exists() and key_path.exists():
-            fp_hex = _read_pem_cert_fingerprint(cert_path)
-            if fp_hex:
-                try:
+            logging.warning("[AUTH] Falling back to LEGACY fingerprint-only auth (DEPRECATED)")
+            try:
+                fp_hex = _read_pem_cert_fingerprint(cert_path)
+                if fp_hex:
                     sock.sendall(f"HELLO CERTFP:{fp_hex}".encode())
-                    resp = sock.recv(1024).decode("utf-8", errors="replace").strip()
-                    logging.debug("Cert handshake response: %s", resp)
+                    resp = sock.recv(2048).decode("utf-8", errors="replace").strip()
+
                     if resp.startswith("OK:"):
                         parts = resp.split(":", 2)
                         host_encoder = parts[1].strip()
@@ -218,43 +582,26 @@ def tcp_handshake_client(host_ip, pin=None):
                         sock.close()
                         CLIENT_STATE["connected"] = True
                         CLIENT_STATE["last_heartbeat"] = time.time()
-                        logging.info("Authenticated via client certificate (FP %s…) — PIN skipped", fp_hex[:12])
+                        logging.warning("[AUTH] ✓ Authenticated via fingerprint (LEGACY - insecure)")
                         return (True, (host_encoder, monitor_info))
-                    if resp.startswith("FAIL:UNTRUSTEDCERT"):
-                        logging.warning("Client cert not yet trusted by host — falling back to PIN.")
-                    else:
-                        logging.warning("Unexpected response to CERTFP auth (%s) — falling back to PIN", resp)
-                except Exception as _e:
-                    logging.debug("CERTFP path failed: %s — falling back to PIN", _e)
 
+                    logging.warning("[AUTH] Legacy fingerprint auth failed: %s", resp)
+            except Exception as e:
+                logging.debug("[AUTH] Legacy fingerprint auth error: %s", e)
+
+        # PATH 4: LEGACY - PIN-only (most insecure)
+        logging.warning("[AUTH] Falling back to LEGACY PIN-only auth (INSECURE)")
         code = (pin or "").strip()
         if not code or len(code) != 6 or not code.isdigit():
-            dlg = QInputDialog()
-            dlg.setWindowTitle("Enter Host PIN")
-            dlg.setLabelText("6-digit PIN (rotates every 30s):")
-            dlg.setInputMode(QInputDialog.TextInput)
-            dlg.resize(360, 150)
-
-            le = dlg.findChild(QLineEdit)
-            if le is None:
-                dlg.setTextValue("")
-                le = dlg.findChild(QLineEdit)
-            if le is not None:
-                le.setEchoMode(QLineEdit.Password)
-                le.setMaxLength(6)
-                le.setPlaceholderText("••••••")
-
-            ok = dlg.exec_()
-            code = dlg.textValue().strip()
-            if not ok or not code or not code.isdigit() or len(code) != 6:
+            code = _ask_pin()
+            if not code or not code.isdigit() or len(code) != 6:
                 sock.close()
-                logging.error("PIN entry cancelled or invalid.")
-                QMessageBox.critical(None, "Invalid PIN", "PIN entry was cancelled or invalid.")
+                logging.error("PIN entry cancelled or invalid")
+                _show_error("Invalid PIN", "PIN entry was cancelled or invalid.")
                 return (False, None)
 
         sock.sendall(f"HELLO {code}".encode())
-        resp = sock.recv(1024).decode("utf-8", errors="replace").strip()
-        logging.debug("Handshake response: %s", resp)
+        resp = sock.recv(2048).decode("utf-8", errors="replace").strip()
 
         if resp.startswith("OK:"):
             parts = resp.split(":", 2)
@@ -263,28 +610,35 @@ def tcp_handshake_client(host_ip, pin=None):
             sock.close()
             CLIENT_STATE["connected"] = True
             CLIENT_STATE["last_heartbeat"] = time.time()
+            logging.warning("[AUTH] ✓ Authenticated via PIN-only (LEGACY - insecure)")
             return (True, (host_encoder, monitor_info))
 
         if resp.startswith("BUSY"):
-            logging.error("Host is already in a session with another client.")
-            QMessageBox.critical(None, "Host Busy", "The host is already connected to another client.")
+            logging.error("Host is already in a session")
+            _show_error("Host Busy", "The host is already connected to another client.")
             sock.close()
             return (False, None)
 
         if resp.startswith("FAIL:BADPIN"):
-            logging.error("Incorrect or expired PIN.")
-            QMessageBox.critical(None, "Authentication Failed", "The PIN is incorrect or expired. Please try again.")
+            logging.error("Incorrect or expired PIN")
+            _show_error("Authentication Failed", "The PIN is incorrect or expired.")
+            sock.close()
+            return (False, None)
+
+        if resp.startswith("FAIL:RATELIMIT"):
+            logging.error("Rate limited")
+            _show_error("Rate Limited", "Too many failed attempts. Please wait.")
             sock.close()
             return (False, None)
 
         logging.error("Unexpected handshake response: %s", resp)
-        QMessageBox.critical(None, "Handshake Error", f"Unexpected response from host:\n{resp}")
+        _show_error("Handshake Error", f"Unexpected response from host:\n{resp}")
         sock.close()
         return (False, None)
 
     except Exception as e:
         logging.error("Handshake failed: %s", e)
-        QMessageBox.critical(None, "Connection Error", f"Handshake failed:\n{e}")
+        _show_error("Connection Error", f"Handshake failed:\n{e}")
         with contextlib.suppress(Exception):
             sock.close()
         return (False, None)
@@ -1625,7 +1979,7 @@ def main():
 
     ok, host_info = tcp_handshake_client(args.host_ip, args.pin)
     if not ok or not host_info:
-        QMessageBox.critical(None, "Handshake Failed", "Could not negotiate with host.")
+        _show_error("Handshake Failed", "Could not negotiate with host.")
         sys.exit(1)
     _host_encoder, monitor_info_str = host_info
     CLIENT_STATE["connected"] = True

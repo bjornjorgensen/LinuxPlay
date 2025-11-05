@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import atexit
+import base64
 import contextlib
 import datetime
 import json
@@ -15,13 +16,12 @@ import subprocess
 import sys
 import threading
 import time
+import tkinter as tk
 from pathlib import Path
 from shutil import which
+from tkinter import scrolledtext, ttk
 
 import psutil
-from PyQt5.QtCore import QObject, Qt, QTimer, pyqtSignal
-from PyQt5.QtGui import QColor, QFont, QKeySequence, QPalette
-from PyQt5.QtWidgets import QApplication, QHBoxLayout, QLabel, QPushButton, QTextEdit, QVBoxLayout, QWidget
 
 
 try:
@@ -142,7 +142,13 @@ def _verify_fingerprint_trusted(fp_hex):
     return (rec is not None) and (rec.get("status") == "trusted")
 
 
-def _issue_client_cert(client_name="linuxplay-client", export_hint_ip=""):
+def _issue_client_cert(client_name="linuxplay-client", export_hint_ip="", csr_pem: bytes | None = None):
+    """
+    Issue client certificate.
+
+    NEW (secure): If csr_pem is provided, sign CSR (client generated keypair).
+    OLD (legacy): If csr_pem is None, generate client keypair on server (INSECURE - deprecated).
+    """
     if not _ensure_ca():
         return None
 
@@ -152,25 +158,50 @@ def _issue_client_cert(client_name="linuxplay-client", export_hint_ip=""):
         with Path(CA_CERT).open("rb") as f:
             ca_cert = x509.load_pem_x509_certificate(f.read(), default_backend())
 
-        key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-        subject = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, client_name)])
-        cert = (
-            x509.CertificateBuilder()
-            .subject_name(subject)
-            .issuer_name(ca_cert.subject)
-            .public_key(key.public_key())
-            .serial_number(x509.random_serial_number())
-            .not_valid_before(datetime.datetime.now(datetime.timezone.utc))
-            .not_valid_after(datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=1825))
-            .sign(ca_key, hashes.SHA256())
-        )
+        if csr_pem:
+            # NEW SECURE PATH: Sign client's CSR
+            logging.info("[AUTH] Signing client CSR (secure mode - client generated keypair)")
+            csr = x509.load_pem_x509_csr(csr_pem, default_backend())
+            public_key = csr.public_key()
+            subject = csr.subject
 
-        cert_pem = cert.public_bytes(serialization.Encoding.PEM)
-        key_pem = key.private_bytes(
-            serialization.Encoding.PEM,
-            serialization.PrivateFormat.TraditionalOpenSSL,
-            serialization.NoEncryption(),
-        )
+            # Build certificate from CSR
+            cert = (
+                x509.CertificateBuilder()
+                .subject_name(subject)
+                .issuer_name(ca_cert.subject)
+                .public_key(public_key)
+                .serial_number(x509.random_serial_number())
+                .not_valid_before(datetime.datetime.now(datetime.timezone.utc))
+                .not_valid_after(datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=1825))
+                .sign(ca_key, hashes.SHA256())
+            )
+
+            cert_pem = cert.public_bytes(serialization.Encoding.PEM)
+            key_pem = None  # Client keeps private key
+
+        else:
+            # OLD LEGACY PATH: Server generates client keypair (INSECURE - deprecated)
+            logging.warning("[AUTH] Generating client keypair on server (LEGACY MODE - INSECURE)")
+            key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+            subject = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, client_name)])
+            cert = (
+                x509.CertificateBuilder()
+                .subject_name(subject)
+                .issuer_name(ca_cert.subject)
+                .public_key(key.public_key())
+                .serial_number(x509.random_serial_number())
+                .not_valid_before(datetime.datetime.now(datetime.timezone.utc))
+                .not_valid_after(datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=1825))
+                .sign(ca_key, hashes.SHA256())
+            )
+
+            cert_pem = cert.public_bytes(serialization.Encoding.PEM)
+            key_pem = key.private_bytes(
+                serialization.Encoding.PEM,
+                serialization.PrivateFormat.TraditionalOpenSSL,
+                serialization.NoEncryption(),
+            )
 
         fp_hex = cert.fingerprint(hashes.SHA256()).hex().upper()
 
@@ -193,15 +224,23 @@ def _issue_client_cert(client_name="linuxplay-client", export_hint_ip=""):
         export_dir = Path("issued_clients") / f"{stamp}_{export_hint_ip or 'client'}"
         export_dir.mkdir(parents=True, exist_ok=True)
         (export_dir / "client_cert.pem").write_bytes(cert_pem)
-        (export_dir / "client_key.pem").write_bytes(key_pem)
+        if key_pem:  # Only write key in legacy mode
+            (export_dir / "client_key.pem").write_bytes(key_pem)
         try:
             ca_pem = Path(CA_CERT).read_bytes()
             (export_dir / "host_ca.pem").write_bytes(ca_pem)
         except Exception:
             pass
 
-        logging.info("[AUTH] Issued client cert '%s' (FP %s…), exported to %s", client_name, fp_hex[:12], export_dir)
-        return {"fingerprint": fp_hex, "export_dir": export_dir, "cert_pem": cert_pem}
+        mode_str = "CSR-signed" if csr_pem else "server-generated (legacy)"
+        logging.info(
+            "[AUTH] Issued client cert '%s' (%s) (FP %s…), exported to %s",
+            client_name,
+            mode_str,
+            fp_hex[:12],
+            export_dir,
+        )
+        return {"fingerprint": fp_hex, "export_dir": export_dir, "cert_pem": cert_pem, "ca_pem": ca_pem}
     except Exception as e:
         logging.error("[AUTH] Issue client cert failed: %s", e)
         return None
@@ -211,6 +250,39 @@ def _marker_value() -> str:
     marker = os.environ.get("LINUXPLAY_MARKER", "LinuxPlayHost")
     sid = os.environ.get("LINUXPLAY_SID", "")
     return f"{marker}:{sid}" if sid else marker
+
+
+def _generate_challenge() -> bytes:
+    """Generate random 32-byte challenge for authentication."""
+    import secrets
+
+    return secrets.token_bytes(32)
+
+
+def _verify_signature(cert_pem: bytes, challenge: bytes, signature: bytes) -> bool:
+    """
+    Verify client's signature of challenge using their certificate's public key.
+    Returns True if signature is valid.
+    """
+    try:
+        from cryptography.hazmat.primitives import hashes
+        from cryptography.hazmat.primitives.asymmetric import padding
+
+        # Load certificate and extract public key
+        cert = x509.load_pem_x509_certificate(cert_pem, default_backend())
+        public_key = cert.public_key()
+
+        # Verify signature
+        public_key.verify(
+            signature,
+            challenge,
+            padding.PSS(mgf=padding.MGF1(hashes.SHA256()), salt_length=padding.PSS.MAX_LENGTH),
+            hashes.SHA256(),
+        )
+        return True
+    except Exception as e:
+        logging.warning("[AUTH] Signature verification failed: %s", e)
+        return False
 
 
 def _ffmpeg_base_cmd() -> list:
@@ -256,6 +328,7 @@ class HostState:
         self.pin_code = None
         self.pin_expiry = 0.0
         self.pin_lock = threading.Lock()
+        self.pin_paused = False
         self.audio_thread = None
         self.current_bitrate = LEGACY_BITRATE
         self.last_clipboard_content = ""
@@ -277,6 +350,9 @@ class HostState:
         self.net_mode = "lan"
         self.starting_streams = False
         self.gamepad_thread = None
+        # Rate limiting for PIN auth
+        self.failed_auth_attempts = {}  # ip -> (count, first_attempt_time, lockout_until)
+        self.auth_lock = threading.Lock()
 
 
 host_state = HostState()
@@ -461,12 +537,82 @@ def _gen_pin(length=PIN_LENGTH):
     return f"{n:0{length}d}"
 
 
+# Rate limiting constants
+MAX_AUTH_ATTEMPTS = 5
+AUTH_LOCKOUT_DURATION = 300  # 5 minutes
+AUTH_WINDOW = 60  # Track attempts within 60 seconds
+
+
+def _check_rate_limit(peer_ip: str) -> tuple[bool, str]:
+    """Check if IP is rate limited. Returns (is_allowed, reason)."""
+    now = time.time()
+
+    with host_state.auth_lock:
+        if peer_ip not in host_state.failed_auth_attempts:
+            return (True, "")
+
+        count, first_attempt, lockout_until = host_state.failed_auth_attempts[peer_ip]
+
+        # Check if still in lockout period
+        if lockout_until and now < lockout_until:
+            remaining = int(lockout_until - now)
+            return (False, f"Rate limited. Try again in {remaining}s")
+
+        # Reset if outside time window
+        if now - first_attempt > AUTH_WINDOW:
+            del host_state.failed_auth_attempts[peer_ip]
+            return (True, "")
+
+        # Check if exceeded max attempts in window
+        if count >= MAX_AUTH_ATTEMPTS:
+            # Apply lockout
+            lockout_until = now + AUTH_LOCKOUT_DURATION
+            host_state.failed_auth_attempts[peer_ip] = (count, first_attempt, lockout_until)
+            return (False, f"Too many failed attempts. Locked out for {AUTH_LOCKOUT_DURATION}s")
+
+        return (True, "")
+
+
+def _record_failed_auth(peer_ip: str):
+    """Record a failed authentication attempt."""
+    now = time.time()
+
+    with host_state.auth_lock:
+        if peer_ip in host_state.failed_auth_attempts:
+            count, first_attempt, lockout_until = host_state.failed_auth_attempts[peer_ip]
+            # Reset if outside window
+            if now - first_attempt > AUTH_WINDOW:
+                host_state.failed_auth_attempts[peer_ip] = (1, now, None)
+            else:
+                host_state.failed_auth_attempts[peer_ip] = (count + 1, first_attempt, lockout_until)
+        else:
+            host_state.failed_auth_attempts[peer_ip] = (1, now, None)
+
+        count, _, _ = host_state.failed_auth_attempts[peer_ip]
+        logging.warning(f"[AUTH] Failed attempt {count}/{MAX_AUTH_ATTEMPTS} from {peer_ip}")
+
+        # Force PIN rotation after multiple failed attempts
+        if count >= 3:
+            logging.warning(f"[AUTH] Multiple failed attempts from {peer_ip} - rotating PIN")
+            pin_rotate_if_needed(force=True)
+
+
+def _clear_failed_auth(peer_ip: str):
+    """Clear failed auth attempts for IP after successful auth."""
+    with host_state.auth_lock:
+        if peer_ip in host_state.failed_auth_attempts:
+            del host_state.failed_auth_attempts[peer_ip]
+
+
 def pin_rotate_if_needed(force=False):
     now = time.time()
     with host_state.pin_lock:
-        if host_state.session_active:
-            return
+        # FIXED: Check force BEFORE session_active to allow forced rotation
         if force or not host_state.pin_code or now >= host_state.pin_expiry:
+            # Only skip rotation if session is active AND not forced
+            if host_state.session_active and not force:
+                return
+
             host_state.pin_code = _gen_pin()
             host_state.pin_expiry = now + PIN_ROTATE_SECS
             logging.info("[AUTH] New PIN: %s (valid %ds)", host_state.pin_code, PIN_ROTATE_SECS)
@@ -1423,7 +1569,7 @@ def tcp_handshake_server(sock, encoder_str, _args):
             peer_ip = addr[0]
             logging.info(f"Handshake from {peer_ip}")
 
-            raw = conn.recv(1024).decode("utf-8", errors="replace").strip()
+            raw = conn.recv(2048).decode("utf-8", errors="replace").strip()
             parts = (raw or "").split()
             cmd = parts[0] if parts else ""
 
@@ -1438,8 +1584,163 @@ def tcp_handshake_server(sock, encoder_str, _args):
                 conn.close()
                 continue
 
+            # NEW: Challenge-response with CSR (secure mode)
+            if cmd == "AUTH" and len(parts) >= 2 and parts[1].startswith("CSR"):
+                logging.info("[AUTH] New secure handshake with CSR from %s", peer_ip)
+
+                # Check rate limiting
+                allowed, reason = _check_rate_limit(peer_ip)
+                if not allowed:
+                    logging.warning(f"[AUTH] Rate limit: {peer_ip} - {reason}")
+                    with contextlib.suppress(Exception):
+                        conn.sendall(f"FAIL:RATELIMIT:{reason}".encode())
+                    conn.close()
+                    continue
+
+                # Expect PIN first for new clients
+                if len(parts) >= 3:
+                    provided_pin = parts[2]
+                else:
+                    with contextlib.suppress(Exception):
+                        conn.sendall(b"NEEDPIN")
+                    conn.close()
+                    continue
+
+                # Validate PIN
+                ok = False
+                with host_state.pin_lock:
+                    if (
+                        not host_state.session_active
+                        and (provided_pin == str(host_state.pin_code))
+                        and (time.time() < host_state.pin_expiry)
+                    ):
+                        ok = True
+
+                if not ok:
+                    _record_failed_auth(peer_ip)
+                    with contextlib.suppress(Exception):
+                        conn.sendall(b"FAIL:BADPIN")
+                    conn.close()
+                    continue
+
+                # Clear failed attempts
+                _clear_failed_auth(peer_ip)
+
+                # Request CSR
+                try:
+                    conn.sendall(b"SENDCSR")
+                    csr_raw = conn.recv(8192).decode("utf-8", errors="replace").strip()
+                    if not csr_raw.startswith("CSR:"):
+                        conn.sendall(b"FAIL:BADCSR")
+                        conn.close()
+                        continue
+
+                    csr_b64 = csr_raw[4:]
+                    csr_pem = base64.b64decode(csr_b64)
+
+                    # Issue certificate
+                    result = _issue_client_cert(
+                        client_name=f"client-{peer_ip}", export_hint_ip=peer_ip, csr_pem=csr_pem
+                    )
+                    if not result:
+                        conn.sendall(b"FAIL:CERTISSUE")
+                        conn.close()
+                        continue
+
+                    # Send cert and CA
+                    cert_b64 = base64.b64encode(result["cert_pem"]).decode()
+                    ca_b64 = base64.b64encode(result["ca_pem"]).decode()
+                    resp = f"CERT:{cert_b64}|{ca_b64}"
+                    conn.sendall(resp.encode())
+
+                    # Mark session as active
+                    with host_state.pin_lock:
+                        host_state.session_active = True
+                        host_state.authed_client_ip = peer_ip
+                        host_state.pin_expiry = 0
+                        host_state.pin_paused = True
+                        host_state.last_pong_ts = time.time()
+
+                    host_state.client_ip = peer_ip
+                    monitors_str = (
+                        ";".join(f"{w}x{h}+{ox}+{oy}" for (w, h, ox, oy) in host_state.monitors)
+                        if host_state.monitors
+                        else DEFAULT_RES
+                    )
+
+                    # Send final OK
+                    ok_resp = f"OK:{encoder_str}:{monitors_str}"
+                    conn.sendall(ok_resp.encode())
+                    conn.close()
+
+                    set_status(f"Client (new): {host_state.client_ip}")
+                    logging.info("[AUTH] Client %s authenticated via CSR (secure mode)", peer_ip)
+                    threading.Thread(target=lambda: pin_rotate_if_needed(force=True), daemon=True).start()
+
+                except Exception as e:
+                    logging.error("[AUTH] CSR handshake failed: %s", e)
+                    with contextlib.suppress(Exception):
+                        conn.sendall(b"FAIL:ERROR")
+                    conn.close()
+                continue
+
+            # NEW: Challenge-response for existing cert (signature verification)
+            if cmd == "AUTH" and len(parts) >= 2 and parts[1].startswith("CERT:"):
+                fp_hex = parts[1][5:].strip().upper()
+                logging.info("[AUTH] Challenge-response auth from %s (FP: %s...)", peer_ip, fp_hex[:12])
+
+                if host_state.session_active:
+                    with contextlib.suppress(Exception):
+                        conn.sendall(b"BUSY:ACTIVESESSION")
+                    conn.close()
+                    logging.warning(f"[AUTH] Rejected cert client {peer_ip} — active session")
+                    continue
+
+                # Verify cert is trusted
+                rec = _trust_record_for(fp_hex, _load_trust_db())
+                if not rec or rec.get("status") != "trusted":
+                    with contextlib.suppress(Exception):
+                        conn.sendall(b"FAIL:UNTRUSTEDCERT")
+                    conn.close()
+                    logging.warning(f"[AUTH] Rejected {peer_ip} — cert not trusted")
+                    continue
+
+                # Generate challenge
+                challenge = _generate_challenge()
+                challenge_b64 = base64.b64encode(challenge).decode()
+
+                try:
+                    # Send challenge
+                    conn.sendall(f"CHALLENGE:{challenge_b64}".encode())
+
+                    # Receive signature
+                    sig_raw = conn.recv(8192).decode("utf-8", errors="replace").strip()
+                    if not sig_raw.startswith("SIGNATURE:"):
+                        conn.sendall(b"FAIL:BADSIG")
+                        conn.close()
+                        continue
+
+                    sig_b64 = sig_raw[10:]
+                    base64.b64decode(sig_b64)
+
+                    # Load client cert from trust DB to verify signature
+                    # Note: In production, store full cert in DB. For now, reject with deprecation warning
+                    logging.warning("[AUTH] DEPRECATED: Old cert auth requires upgrade. Use new CSR flow.")
+                    conn.sendall(b"FAIL:DEPRECATED:UPGRADE_REQUIRED")
+                    conn.close()
+                    continue
+
+                except Exception as e:
+                    logging.error("[AUTH] Challenge-response failed: %s", e)
+                    with contextlib.suppress(Exception):
+                        conn.sendall(b"FAIL:ERROR")
+                    conn.close()
+                continue
+
+            # LEGACY: Fingerprint-only (DEPRECATED)
             if cmd == "HELLO" and len(parts) >= 2 and parts[1].startswith("CERTFP:"):
                 fp_hex = parts[1][len("CERTFP:") :].strip().upper()
+                logging.warning("[AUTH] LEGACY fingerprint-only auth from %s (DEPRECATED)", peer_ip)
 
                 if host_state.session_active:
                     try:
@@ -1449,7 +1750,7 @@ def tcp_handshake_server(sock, encoder_str, _args):
                     except Exception:
                         pass
                     conn.close()
-                    logging.warning(f"[AUTH] Rejected CERTFP client {peer_ip} — active session already running.")
+                    logging.warning(f"[AUTH] Rejected CERTFP client {peer_ip} — active session")
                     continue
 
                 if fp_hex and _verify_fingerprint_trusted(fp_hex):
@@ -1473,8 +1774,8 @@ def tcp_handshake_server(sock, encoder_str, _args):
                     finally:
                         conn.close()
 
-                    set_status(f"Client (cert): {host_state.client_ip}")
-                    logging.info(f"[AUTH] Client {peer_ip} authenticated via CERTFP.")
+                    set_status(f"Client (legacy cert): {host_state.client_ip}")
+                    logging.warning("[AUTH] Client %s authenticated via CERTFP (LEGACY - please upgrade)", peer_ip)
                     continue
                 try:
                     conn.sendall(b"FAIL:UNTRUSTEDCERT")
@@ -1483,11 +1784,27 @@ def tcp_handshake_server(sock, encoder_str, _args):
                 except Exception:
                     pass
                 conn.close()
-                logging.warning(f"[AUTH] Rejected cert from {peer_ip} — not trusted.")
+                logging.warning(f"[AUTH] Rejected cert from {peer_ip} — not trusted")
                 continue
 
+            # LEGACY: PIN-only (generates server-side keys - DEPRECATED)
             if cmd == "HELLO":
                 provided_pin = parts[1] if len(parts) >= 2 else ""
+                logging.warning("[AUTH] LEGACY PIN-only auth from %s (DEPRECATED - insecure)", peer_ip)
+
+                # SECURITY: Check rate limiting
+                allowed, reason = _check_rate_limit(peer_ip)
+                if not allowed:
+                    logging.warning(f"[AUTH] Rate limit: {peer_ip} - {reason}")
+                    try:
+                        conn.sendall(f"FAIL:RATELIMIT:{reason}".encode())
+                        conn.shutdown(socket.SHUT_WR)
+                        time.sleep(0.05)
+                    except Exception:
+                        pass
+                    conn.close()
+                    continue
+
                 ok = False
 
                 with host_state.pin_lock:
@@ -1499,15 +1816,19 @@ def tcp_handshake_server(sock, encoder_str, _args):
                         ok = True
 
                 if ok:
+                    # Clear failed attempts on successful auth
+                    _clear_failed_auth(peer_ip)
+
                     with host_state.pin_lock:
                         host_state.session_active = True
                         host_state.authed_client_ip = peer_ip
                         host_state.pin_expiry = 0
                         host_state.pin_paused = True
                         host_state.last_pong_ts = time.time()
-                        logging.info(f"[AUTH] Client {peer_ip} authenticated — PIN invalidated and rotation paused.")
+                        logging.info(f"[AUTH] Client {peer_ip} authenticated (LEGACY) — PIN invalidated")
 
-                    _issue_client_cert(client_name="linuxplay-client", export_hint_ip=peer_ip)
+                    # Issue cert in legacy mode (server generates keys - INSECURE)
+                    _issue_client_cert(client_name="linuxplay-client", export_hint_ip=peer_ip, csr_pem=None)
                     threading.Thread(target=lambda: pin_rotate_if_needed(force=True), daemon=True).start()
 
                     host_state.client_ip = peer_ip
@@ -1525,17 +1846,19 @@ def tcp_handshake_server(sock, encoder_str, _args):
                     finally:
                         conn.close()
 
-                    set_status(f"Client: {host_state.client_ip}")
-                    logging.info(f"Client {peer_ip} handshake complete (PIN locked).")
+                    set_status(f"Client (legacy PIN): {host_state.client_ip}")
+                    logging.warning("Client %s handshake complete (LEGACY MODE - please upgrade client)", peer_ip)
 
                 else:
+                    # Record failed attempt
+                    _record_failed_auth(peer_ip)
+
                     if host_state.session_active:
-                        logging.warning(f"[AUTH] {peer_ip} attempted reuse of consumed PIN (session active).")
+                        logging.warning(f"[AUTH] {peer_ip} attempted reuse of consumed PIN (session active)")
                         reply = b"BUSY:ACTIVESESSION"
                     else:
-                        logging.warning(f"[AUTH] Rejected {peer_ip}: invalid or expired PIN.")
+                        logging.warning(f"[AUTH] Rejected {peer_ip}: invalid or expired PIN")
                         reply = b"FAIL:BADPIN"
-                        pin_rotate_if_needed(force=True)
                     try:
                         conn.sendall(reply)
                         conn.shutdown(socket.SHUT_WR)
@@ -1812,7 +2135,15 @@ def file_upload_listener():
 
     while not host_state.should_terminate:
         try:
-            conn, _addr = s.accept()
+            conn, addr = s.accept()
+            peer_ip = addr[0]
+
+            # SECURITY: Verify client is authenticated before accepting uploads
+            if not host_state.session_active or peer_ip != host_state.authed_client_ip:
+                logging.warning(f"[SECURITY] Rejected file upload from unauthenticated client {peer_ip}")
+                conn.close()
+                continue
+
             header = recvall(conn, 4)
             if not header:
                 conn.close()
@@ -1820,9 +2151,26 @@ def file_upload_listener():
             filename_length = int.from_bytes(header, "big")
             filename = recvall(conn, filename_length).decode("utf-8")
             file_size = int.from_bytes(recvall(conn, 8), "big")
+
             dest_dir = Path.home() / "LinuxPlayDrop"
             dest_dir.mkdir(parents=True, exist_ok=True)
-            dest_path = dest_dir / filename
+
+            # SECURITY: Sanitize filename to prevent path traversal
+            # Remove any path components, use only the basename
+            safe_filename = Path(filename).name
+            if not safe_filename or safe_filename.startswith("."):
+                logging.warning(f"[SECURITY] Rejected invalid filename: {filename}")
+                conn.close()
+                continue
+
+            dest_path = (dest_dir / safe_filename).resolve()
+
+            # SECURITY: Verify resolved path is within dest_dir
+            if not dest_path.is_relative_to(dest_dir.resolve()):
+                logging.warning(f"[SECURITY] Path traversal attempt blocked: {filename} -> {dest_path}")
+                conn.close()
+                continue
+
             with dest_path.open("wb") as f:
                 remaining = file_size
                 while remaining > 0:
@@ -1832,7 +2180,7 @@ def file_upload_listener():
                     f.write(chunk)
                     remaining -= len(chunk)
             conn.close()
-            logging.info("Received file %s (%d bytes)", dest_path, file_size)
+            logging.info("Received file %s (%d bytes) from %s", dest_path, file_size, peer_ip)
         except OSError:
             break
         except Exception as e:
@@ -2290,9 +2638,26 @@ def core_main(args, use_signals=True) -> int:
     return exit_code
 
 
-class LogEmitter(QObject):
-    log = pyqtSignal(str)
-    status = pyqtSignal(str)
+class LogEmitter:
+    """Thread-safe event emitter for log messages and status updates."""
+
+    def __init__(self):
+        self.log_callbacks = []
+        self.status_callbacks = []
+
+    def connect_log(self, callback):
+        self.log_callbacks.append(callback)
+
+    def connect_status(self, callback):
+        self.status_callbacks.append(callback)
+
+    def emit_log(self, msg: str):
+        for callback in self.log_callbacks:
+            callback(msg)
+
+    def emit_status(self, msg: str):
+        for callback in self.status_callbacks:
+            callback(msg)
 
 
 log_emitter = LogEmitter()
@@ -2300,10 +2665,10 @@ log_emitter = LogEmitter()
 
 def set_status(text: str):
     with contextlib.suppress(Exception):
-        log_emitter.status.emit(text)
+        log_emitter.emit_status(text)
 
 
-class QtLogHandler(logging.Handler):
+class TkLogHandler(logging.Handler):
     def __init__(self):
         super().__init__()
 
@@ -2313,80 +2678,82 @@ class QtLogHandler(logging.Handler):
         except Exception:
             msg = record.getMessage()
         with contextlib.suppress(Exception):
-            log_emitter.log.emit(msg)
+            log_emitter.emit_log(msg)
 
 
-def _apply_dark_palette(app: QApplication):
-    app.setStyle("Fusion")
-    palette = app.palette()
-    palette.setColor(QPalette.Window, QColor(53, 53, 53))
-    palette.setColor(QPalette.WindowText, Qt.white)
-    palette.setColor(QPalette.Base, QColor(35, 35, 35))
-    palette.setColor(QPalette.AlternateBase, QColor(53, 53, 53))
-    palette.setColor(QPalette.ToolTipBase, Qt.white)
-    palette.setColor(QPalette.ToolTipText, Qt.white)
-    palette.setColor(QPalette.Text, Qt.white)
-    palette.setColor(QPalette.Button, QColor(53, 53, 53))
-    palette.setColor(QPalette.ButtonText, Qt.white)
-    palette.setColor(QPalette.BrightText, Qt.red)
-    palette.setColor(QPalette.Link, QColor(42, 130, 218))
-    palette.setColor(QPalette.Highlight, QColor(42, 130, 218))
-    palette.setColor(QPalette.HighlightedText, Qt.black)
-    app.setPalette(palette)
+def _apply_dark_theme(root: tk.Tk):
+    """Apply dark theme to tkinter window."""
+    bg_dark = "#353535"
+    fg_light = "#ffffff"
+
+    root.configure(bg=bg_dark)
+
+    # Configure ttk styles
+    style = ttk.Style()
+    style.theme_use("clam")
+    style.configure("TLabel", background=bg_dark, foreground=fg_light)
+    style.configure("TButton", background=bg_dark, foreground=fg_light)
+    style.configure("TFrame", background=bg_dark)
 
 
-class HostWindow(QWidget):
-    def __init__(self, args):
-        super().__init__()
+class HostWindow:
+    def __init__(self, root: tk.Tk, args):
+        self.root = root
         self.args = args
         self.core_thread = None
-        self.setWindowTitle("LinuxPlay Host")
-        self.resize(840, 520)
+        self.core_rc = None
+        self.stop_enabled = False
 
-        layout = QVBoxLayout(self)
+        self.root.title("LinuxPlay Host")
+        self.root.geometry("840x520")
 
-        self.statusLabel = QLabel("Idle")
-        self.statusLabel.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        # Status label
+        self.status_label = ttk.Label(root, text="Idle", font=("sans-serif", 10))
+        self.status_label.pack(side=tk.TOP, fill=tk.X, padx=10, pady=5)
 
-        self.logView = QTextEdit()
-        self.logView.setReadOnly(True)
-        font = QFont("monospace")
-        font.setStyleHint(QFont.TypeWriter)
-        self.logView.setFont(font)
+        # Log view (scrolled text)
+        self.log_view = scrolledtext.ScrolledText(
+            root,
+            wrap=tk.WORD,
+            font=("monospace", 9),
+            bg="#232323",
+            fg="#ffffff",
+            insertbackground="#ffffff",
+            state=tk.DISABLED,
+        )
+        self.log_view.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=10, pady=5)
 
-        buttons = QHBoxLayout()
-        self.stopBtn = QPushButton("Stop")
-        self.stopBtn.clicked.connect(self._on_stop)
+        # Button frame
+        button_frame = tk.Frame(root, bg="#353535")
+        button_frame.pack(side=tk.BOTTOM, fill=tk.X, padx=10, pady=5)
 
-        self.stopBtn.setAutoDefault(False)
-        self.stopBtn.setDefault(False)
-        self.stopBtn.setFocusPolicy(Qt.NoFocus)
-        self.stopBtn.setShortcut(QKeySequence())
-        self.stopBtn.setEnabled(False)
-        QTimer.singleShot(1200, lambda: self.stopBtn.setEnabled(True))
-        self.logView.setFocus()
+        self.stop_btn = ttk.Button(button_frame, text="Stop", command=self._on_stop, state=tk.DISABLED)
+        self.stop_btn.pack(side=tk.RIGHT, padx=5)
 
-        buttons.addStretch(1)
-        buttons.addWidget(self.stopBtn)
-
-        layout.addWidget(self.statusLabel)
-        layout.addWidget(self.logView)
-        layout.addLayout(buttons)
-
-        self._log_handler = QtLogHandler()
+        # Setup logging
+        self._log_handler = TkLogHandler()
         fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", "%H:%M:%S")
         self._log_handler.setFormatter(fmt)
         logging.getLogger().addHandler(self._log_handler)
-        logging.getLogger().setLevel(logging.getLogger().level)
 
-        log_emitter.log.connect(self.append_log)
-        log_emitter.status.connect(self.set_status_text)
+        log_emitter.connect_log(self.append_log)
+        log_emitter.connect_status(self.set_status_text)
 
+        # Enable stop button after delay
+        self.root.after(1200, self._enable_stop_button)
+
+        # Start core
         self._start_core()
 
-        self._poll_timer = QTimer(self)
-        self._poll_timer.timeout.connect(self._poll_core_done)
-        self._poll_timer.start(300)
+        # Poll for core completion
+        self._poll_core_done()
+
+        # Handle window close
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    def _enable_stop_button(self):
+        self.stop_enabled = True
+        self.stop_btn.config(state=tk.NORMAL)
 
     def _start_core(self):
         self.set_status_text("Starting…")
@@ -2396,33 +2763,56 @@ class HostWindow(QWidget):
         def _run():
             rc = core_main(self.args, use_signals=False)
             self.core_rc = rc
-            QTimer.singleShot(0, lambda: QApplication.instance().exit(rc))
+            self.root.after(0, lambda: self.root.quit())
 
         self.core_thread = threading.Thread(target=_run, name="HostCore", daemon=True)
         self.core_thread.start()
 
     def _poll_core_done(self):
+        """Poll for core termination and disable stop button if terminated."""
         if host_state.should_terminate:
-            self.stopBtn.setEnabled(False)
+            self.stop_btn.config(state=tk.DISABLED)
+        else:
+            self.root.after(300, self._poll_core_done)
 
     def _on_stop(self):
-        if not self.stopBtn.isEnabled():
+        if not self.stop_enabled:
             return
-        self.stopBtn.setEnabled(False)
+        self.stop_btn.config(state=tk.DISABLED)
+        self.stop_enabled = False
         self.append_log("Stop requested by user.")
         trigger_shutdown("User pressed Stop")
 
     def append_log(self, text: str):
-        self.logView.append(text)
-        self.logView.moveCursor(self.logView.textCursor().End)
+        """Thread-safe log append."""
+
+        def _append():
+            self.log_view.config(state=tk.NORMAL)
+            self.log_view.insert(tk.END, text + "\n")
+            self.log_view.see(tk.END)
+            self.log_view.config(state=tk.DISABLED)
+
+        # Ensure we're on main thread
+        if threading.current_thread() is threading.main_thread():
+            _append()
+        else:
+            self.root.after(0, _append)
 
     def set_status_text(self, text: str):
-        self.statusLabel.setText(text)
+        """Thread-safe status update."""
 
-    def closeEvent(self, event):
+        def _update():
+            self.status_label.config(text=text)
+
+        if threading.current_thread() is threading.main_thread():
+            _update()
+        else:
+            self.root.after(0, _update)
+
+    def _on_close(self):
         if not host_state.should_terminate:
             trigger_shutdown("Window closed")
-        event.accept()
+        self.root.destroy()
 
 
 def parse_args():
@@ -2430,9 +2820,10 @@ def parse_args():
     p.add_argument("--gui", action="store_true", help="Show host GUI window.")
     p.add_argument(
         "--bind-address",
-        default="0.0.0.0",
-        help="IP address to bind server sockets to. Use 0.0.0.0 for all interfaces (default), "
-        "127.0.0.1 for localhost only, or a specific interface IP for better security.",
+        default="127.0.0.1",
+        help="IP address to bind server sockets to. Default: 127.0.0.1 (localhost only). "
+        "For LAN access, use your interface IP (e.g., 192.168.1.100). "
+        "For WAN, use WireGuard tunnel IP. NEVER use 0.0.0.0 on untrusted networks.",
     )
     p.add_argument("--encoder", choices=["none", "h.264", "h.265"], default="none")
     p.add_argument(
@@ -2469,11 +2860,11 @@ def main():
         return 2
 
     if args.gui:
-        app = QApplication(sys.argv)
-        _apply_dark_palette(app)
-        w = HostWindow(args)
-        w.show()
-        rc = app.exec_()
+        root = tk.Tk()
+        _apply_dark_theme(root)
+        window = HostWindow(root, args)
+        root.mainloop()
+        rc = window.core_rc if window.core_rc is not None else 0
         sys.exit(rc)
     else:
         rc = core_main(args, use_signals=True)

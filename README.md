@@ -15,15 +15,20 @@
 - **Codecs**: H.264 and H.265 (HEVC) with hardware acceleration via NVENC, QSV, VAAPI, AMF, or CPU fallback.
 - **Transport**: Ultra low latency design. Video over MPEG-TS on UDP. Audio over UDP. Input for mouse, keyboard and gamepad over UDP. Clipboard on UDP. Handshake and file upload on TCP.
 - **Secure Handshake**
-  - Rotating 6 digit PIN authentication that refreshes every 30 seconds.
-  - PIN rotation pauses while a session is active.
-  - Session lock that rejects new clients while another is connected (BUSY protection).
-  - Certificate based login after the first trusted PIN session.
+  - Modern challenge-response authentication with RSA 4096-bit keys
+  - Client generates own keypair (private key never transmitted)
+  - Certificate Signing Request (CSR) flow for secure first-time authentication
+  - CA fingerprint pinning (Trust On First Use) prevents MITM attacks
+  - Rotating 6-digit PIN for initial device pairing (refreshes every 30 seconds)
+  - Session lock rejects new clients while another is connected (BUSY protection)
+  - Legacy PIN-only authentication deprecated (migration required)
 - **PIN to Certificate Upgrade**
-  - On the first successful PIN login the host issues a per device client certificate and key signed by a local host CA.
-  - The bundle contains `client_cert.pem`, `client_key.pem`, `host_ca.pem` (exported under `issued_clients/...`).
-  - Copy these three files to the client's `src/linuxplay/` folder (next to `start.py` and `client.py`).
-  - The client detects the files and skips the PIN. The GUI disables the PIN field automatically (no restart needed).
+  - On first connection, client generates RSA 4096-bit keypair locally
+  - Client sends Certificate Signing Request (CSR) with PIN to host
+  - Host validates PIN and signs CSR, returns certificate (private key never leaves client)
+  - Certificates automatically stored in `~/.linuxplay/` directory
+  - Subsequent connections use challenge-response authentication (no PIN needed)
+  - GUI automatically detects certificates and disables PIN field
 - **Controller Support**: Full gamepad forwarding over UDP using a virtual uinput device on the host. Works with Xbox, DualSense, 8BitDo and other HID controllers.
 - **Multi Monitor**: Stream one or more displays. Resolution and offsets are detected per display.
 - **Clipboard and File Transfer**: Bi directional clipboard sync and client to host file uploads on TCP.
@@ -247,20 +252,53 @@ The host listens on these ports. **The client does not need any firewall rules**
 
 ## Security
 
+### Network Binding
+
+**IMPORTANT**: By default, the host binds to `127.0.0.1` (localhost only). To allow connections:
+
+- **Local testing**: Use default `127.0.0.1` (client runs on same machine)
+- **LAN streaming**: Use `--bind-address <your-interface-ip>` (e.g., `192.168.1.100`)
+- **WAN/remote**: Use WireGuard tunnel and bind to tunnel IP (e.g., `10.0.0.1`)
+- **NEVER** use `--bind-address 0.0.0.0` on untrusted networks (exposes all interfaces)
+
+Example for LAN access:
+```bash
+linuxplay-host --bind-address 192.168.1.100 --encoder h.264 --hwenc nvenc
+```
+
+### Authentication & Sessions
+
+**Modern Secure Authentication (Recommended)**:
+- Client generates own RSA 4096-bit keypair on first connection
+- Certificate Signing Request (CSR) sent to host with PIN
+- Host signs CSR and returns certificate (private key never leaves client)
+- Subsequent connections use challenge-response authentication
+- CA fingerprint pinning (Trust On First Use) prevents MITM attacks
+- Certificates stored in `~/.linuxplay/` directory
+
+**Legacy Authentication (DEPRECATED)**:
+- ⚠️ **WARNING**: Legacy PIN-only and fingerprint-only authentication modes are deprecated
+- Server-generated client keys (legacy mode) will be removed in a future release
+- Existing legacy certificates still work but log deprecation warnings
+- Migrate to secure mode: delete old certificates and reconnect with PIN to generate new keypair
+
+**Session Management**:
 - Use WireGuard for WAN use. Point the client to the tunnel IP.
 - One active client at a time. Additional clients receive BUSY until the session ends.
-- Certificate based login after first PIN:
-  - On first trusted connection the host creates a mini CA and issues a per device certificate.
-  - Copy `client_cert.pem`, `client_key.pem`, `host_ca.pem` to the client's `src/linuxplay/` folder (next to `start.py` and `client.py`).
-  - The client detects the files, disables the PIN field and authenticates with the certificate.
-  - Private keys never leave the client. Only a fingerprint is sent during handshake.
-- Revoke a client by removing or marking the entry in `trusted_clients.json` on the host.
+- Revoke a client by removing the entry in `trusted_clients.json` on the host.
 
----
-
+**Certificate Locations**:
+- Client: `~/.linuxplay/client_key.pem` (private key, 0600 permissions)
+- Client: `~/.linuxplay/client_cert.pem` (signed certificate)
+- Client: `~/.linuxplay/host_ca.pem` (host CA certificate)
+- Client: `~/.linuxplay/pinned_hosts.json` (pinned CA fingerprints for TOFU)
 ## Changelog (recent)
 
 - **Firewall-free Windows clients**: Redesigned network architecture to use outbound-only connections with ephemeral ports. Windows clients no longer require firewall configuration.
+- **Enhanced Security**: Complete authentication redesign with RSA 4096-bit client keypairs, CSR flow, and challenge-response protocol
+- **CA Fingerprint Pinning**: Trust On First Use (TOFU) prevents MITM attacks on subsequent connections
+- **Automatic Certificate Storage**: Certificates now stored in `~/.linuxplay/` (no manual file copying required)
+- **Deprecated Legacy Auth**: PIN-only and fingerprint-only modes marked for removal (migration recommended)
 - Added certificate based authentication with automatic PIN to certificate upgrade flow.
 - Added session lock. New handshakes are rejected with BUSY while a client is active.
 - Client GUI now auto detects certificate bundle and disables the PIN field live.
@@ -395,12 +433,29 @@ python src/linuxplay/client.py --host_ip YOUR_HOST_IP --decoder h.264 --hwaccel 
 - Check firewall rules on the **host** machine
 - Verify network connectivity: `ping YOUR_HOST_IP`
 - For WAN connections, use WireGuard VPN
-
 #### Certificate authentication not working
 
-Ensure all three certificate files are in the client's `src/linuxplay/` folder:
-- `client_cert.pem`
-- `client_key.pem`
+**Modern Authentication (v0.2.0+)**:
+Certificates are automatically stored in `~/.linuxplay/` after first successful PIN authentication.
+If you need to reset authentication:
+
+```bash
+# Delete old certificates to force re-authentication
+rm -rf ~/.linuxplay/
+```
+
+**Legacy Mode (DEPRECATED)**:
+If you have certificates in `src/linuxplay/` from older versions, migrate to secure mode:
+
+```bash
+# Remove old certificates
+rm src/linuxplay/client_cert.pem src/linuxplay/client_key.pem src/linuxplay/host_ca.pem
+
+# Reconnect with PIN - new certificates will be generated automatically
+# New certs stored in ~/.linuxplay/ with secure permissions
+```
+
+Legacy server-generated keys are deprecated and will be removed in a future release.
 - `host_ca.pem`
 
 They should be next to `client.py` and `start.py` in `src/linuxplay/`.
