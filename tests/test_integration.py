@@ -114,7 +114,7 @@ class TestTCPHandshake:
 
         conn.close()
         server.close()
-        thread.join()
+        thread.join(timeout=2)
 
 
 class TestPortConstants:

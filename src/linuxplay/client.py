@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+from __future__ import annotations
+
 import argparse
 import base64
 import contextlib
@@ -22,11 +24,61 @@ import tkinter as tk
 from pathlib import Path
 from queue import Queue
 from tkinter import messagebox, simpledialog
+from typing import TYPE_CHECKING
 
 import av
 import numpy as np
 import psutil
-from OpenGL.GL import *
+from OpenGL.GL import (
+    GL_CLAMP_TO_EDGE,
+    GL_COLOR_BUFFER_BIT,
+    GL_DEPTH_TEST,
+    GL_DITHER,
+    GL_LINEAR,
+    GL_PIXEL_UNPACK_BUFFER,
+    GL_QUADS,
+    GL_RGB,
+    GL_STREAM_DRAW,
+    GL_TEXTURE_2D,
+    GL_TEXTURE_MAG_FILTER,
+    GL_TEXTURE_MIN_FILTER,
+    GL_TEXTURE_WRAP_S,
+    GL_TEXTURE_WRAP_T,
+    GL_UNPACK_ALIGNMENT,
+    GL_UNSIGNED_BYTE,
+    GL_WRITE_ONLY,
+    glBegin,
+    glBindBuffer,
+    glBindTexture,
+    glBufferData,
+    glClear,
+    glClearColor,
+    glDeleteBuffers,
+    glDisable,
+    glEnable,
+    glEnd,
+    glFlush,
+    glGenBuffers,
+    glGenTextures,
+    glMapBuffer,
+    glPixelStorei,
+    glTexCoord2f,
+    glTexImage2D,
+    glTexParameteri,
+    glTexSubImage2D,
+    glUnmapBuffer,
+    glVertex2f,
+)
+
+
+if TYPE_CHECKING:
+    from PyQt5.QtCore import Qt, QThread, QTimer, pyqtSignal
+    from PyQt5.QtGui import QSurfaceFormat
+    from PyQt5.QtWidgets import QApplication, QMainWindow, QOpenGLWidget
+else:
+    from PyQt5.QtCore import Qt, QThread, QTimer, pyqtSignal
+    from PyQt5.QtGui import QSurfaceFormat
+    from PyQt5.QtWidgets import QApplication, QMainWindow, QOpenGLWidget
 
 
 try:
@@ -36,6 +88,8 @@ try:
 except ImportError:
     HAVE_EVDEV = False
 
+# Note: pynvml module provided by nvidia-ml-py package (official NVIDIA library)
+# nvidia-ml-py is the maintained successor to deprecated pynvml package
 try:
     import pynvml
 
@@ -45,26 +99,26 @@ except ImportError:
 
 
 # Tkinter dialog helpers
-def _show_error(title: str, message: str):
+def _show_error(title: str, message: str) -> None:
     """Show error dialog (thread-safe)."""
     try:
         root = tk.Tk()
         root.withdraw()
         messagebox.showerror(title, message, parent=root)
         root.destroy()
-    except Exception:
-        logging.error(f"{title}: {message}")
+    except Exception as e:
+        logging.error(f"{title}: {message} (dialog error: {e})")
 
 
-def _show_info(title: str, message: str):
+def _show_info(title: str, message: str) -> None:
     """Show info dialog (thread-safe)."""
     try:
         root = tk.Tk()
         root.withdraw()
         messagebox.showinfo(title, message, parent=root)
         root.destroy()
-    except Exception:
-        logging.info(f"{title}: {message}")
+    except Exception as e:
+        logging.info(f"{title}: {message} (dialog error: {e})")
 
 
 def _ask_pin(title: str = "Enter Host PIN", prompt: str = "6-digit PIN (rotates every 30s):") -> str:
@@ -88,6 +142,17 @@ UDP_FILE_PORT = 7003
 UDP_HEARTBEAT_PORT = 7004
 UDP_GAMEPAD_PORT = 7005
 UDP_AUDIO_PORT = 6001
+
+# Authentication constants
+PIN_LENGTH = 6  # PIN must be exactly 6 digits
+PROTOCOL_MIN_PARTS = 2  # Minimum parts for protocol messages
+PROTOCOL_WITH_DATA = 3  # Protocol messages with additional data (e.g., "OK:<encoder>:<monitors>")
+HEARTBEAT_TIMEOUT_SECS = 10  # Consider connection lost after 10s without heartbeat
+
+# UDP socket buffer sizes (bytes)
+UDP_SEND_BUFFER_SIZE = 2_097_152  # 2MB send buffer for control
+UDP_RECV_BUFFER_SIZE = 524_288  # 512KB receive buffer
+UDP_BUSY_POLL_USEC = 50  # SO_BUSY_POLL: 50µs for ultra-low latency (requires root or CAP_NET_ADMIN)
 
 DEFAULT_RESOLUTION = "1920x1080"
 
@@ -165,7 +230,16 @@ def choose_auto_hwaccel():
     return "cpu"
 
 
-def _best_ts_pkt_size(mtu_guess: int, ipv6: bool) -> int:
+def _best_ts_pkt_size(mtu_guess: int, ipv6: bool = False) -> int:
+    """Calculate optimal MPEG-TS packet size for UDP transport.
+
+    Args:
+        mtu_guess: Estimated MTU (default 1500 if invalid)
+        ipv6: True if using IPv6 (larger headers)
+
+    Returns:
+        Optimal packet size (multiple of 188 bytes)
+    """
     if mtu_guess <= 0:
         mtu_guess = 1500
     overhead = 48 if ipv6 else 28
@@ -173,44 +247,55 @@ def _best_ts_pkt_size(mtu_guess: int, ipv6: bool) -> int:
     return max(188, (max_payload // 188) * 188)
 
 
-def detect_network_mode(host_ip: str) -> str:
+def _detect_linux_network_mode(host_ip: str) -> str:
+    """Detect network mode on Linux by inspecting routing interface.
+
+    Performance note: Uses subprocess, cache result if called frequently.
+    """
     try:
-        if IS_LINUX:
-            out = subprocess.check_output(
-                ["ip", "route", "get", host_ip], universal_newlines=True, stderr=subprocess.STDOUT
-            )
-            m = re.search(r"\bdev\s+(\S+)", out)
-            iface = m.group(1) if m else ""
-            if iface and Path(f"/sys/class/net/{iface}/wireless").exists():
+        out = subprocess.check_output(
+            ["ip", "route", "get", host_ip],
+            universal_newlines=True,
+            stderr=subprocess.STDOUT,
+            timeout=2,  # Prevent hanging on network issues
+        )
+        m = re.search(r"\bdev\s+(\S+)", out)
+        iface = m.group(1) if m else ""
+        if iface and Path(f"/sys/class/net/{iface}/wireless").exists():
+            return "wifi"
+        if iface.startswith("wl"):
+            return "wifi"
+        return "lan"
+    except (subprocess.SubprocessError, subprocess.TimeoutExpired, Exception) as e:
+        logging.debug(f"Network detection failed: {e}")
+        return "lan"
+
+
+def _detect_windows_network_mode() -> str:
+    """Detect network mode on Windows by checking interface names."""
+    try:
+        # Get network interfaces and check for wireless adapters
+        stats = psutil.net_if_stats()
+
+        # Find active interfaces and check for common wireless patterns
+        for iface_name in stats:
+            if not stats[iface_name].isup:
+                continue
+            # Common patterns for wireless interfaces on Windows
+            iface_lower = iface_name.lower()
+            if any(pattern in iface_lower for pattern in ["wi-fi", "wireless", "wlan", "802.11"]):
                 return "wifi"
-            if iface.startswith("wl"):
-                return "wifi"
-            return "lan"
-        if IS_WINDOWS:
-            ps = [
-                "powershell",
-                "-NoProfile",
-                "-Command",
-                f"(Get-NetRoute -DestinationPrefix {host_ip}/32 | Sort-Object RouteMetric | Select-Object -First 1).InterfaceAlias",
-            ]
-            alias = subprocess.check_output(ps, universal_newlines=True, stderr=subprocess.DEVNULL).strip()
-            if alias:
-                # Remove quotes from alias name
-                alias_clean = alias.replace('"', "")
-                ps2 = [
-                    "powershell",
-                    "-NoProfile",
-                    "-Command",
-                    f"($a = Get-NetAdapter -Name '{alias_clean}') | Select-Object -Expand NdisPhysicalMedium",
-                ]
-                medium = (
-                    subprocess.check_output(ps2, universal_newlines=True, stderr=subprocess.DEVNULL).strip().lower()
-                )
-                if "wireless" in medium or "802.11" in medium:
-                    return "wifi"
-            return "lan"
+        return "lan"
     except Exception:
         return "lan"
+
+
+def detect_network_mode(host_ip: str) -> str:
+    """Detect if connection is over LAN or WiFi."""
+    if IS_LINUX:
+        return _detect_linux_network_mode(host_ip)
+    if IS_WINDOWS:
+        return _detect_windows_network_mode()
     return "lan"
 
 
@@ -229,10 +314,22 @@ def _read_pem_cert_fingerprint(pem_path: str) -> str:
 def _ensure_client_keypair(key_path: Path) -> bool:
     """
     Generate client RSA keypair if not exists.
-    Returns True if newly generated, False if already exists.
-    Private key stays on client - NEVER transmitted.
+
+    Returns:
+        True if newly generated, False if already exists.
+
+    Security:
+        Private key stays on client - NEVER transmitted.
+        File permissions set to 0600 (owner read/write only).
     """
     if key_path.exists():
+        # Verify permissions on existing key
+        try:
+            if key_path.stat().st_mode & 0o777 != 0o600:
+                logging.warning("Client key has insecure permissions, fixing...")
+                key_path.chmod(0o600)
+        except Exception as e:
+            logging.debug(f"Failed to check key permissions: {e}")
         logging.debug("Client keypair already exists at %s", key_path)
         return False
 
@@ -246,8 +343,8 @@ def _ensure_client_keypair(key_path: Path) -> bool:
             key_size=4096,
         )
 
-        # Ensure directory exists
-        key_path.parent.mkdir(parents=True, exist_ok=True)
+        # Ensure directory exists with secure permissions
+        key_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
 
         # Write private key with secure permissions
         key_pem = private_key.private_bytes(
@@ -265,10 +362,10 @@ def _ensure_client_keypair(key_path: Path) -> bool:
         return False
 
 
-def _generate_csr(private_key_path: Path, client_id: str) -> bytes:
+def _generate_csr(private_key_path: Path, client_id: str):
     """
     Generate Certificate Signing Request.
-    Returns CSR in PEM format.
+    Returns CSR in PEM format (bytes).
     """
     try:
         from cryptography import x509
@@ -295,7 +392,7 @@ def _generate_csr(private_key_path: Path, client_id: str) -> bytes:
         return b""
 
 
-def _validate_host_ca_fingerprint(ca_cert_pem: bytes, host_ip: str) -> bool:
+def _validate_host_ca_fingerprint(ca_cert_pem, host_ip: str) -> bool:
     """
     Validate host CA fingerprint using Trust On First Use (TOFU).
     On first connection, pins the fingerprint.
@@ -345,7 +442,7 @@ def _validate_host_ca_fingerprint(ca_cert_pem: bytes, host_ip: str) -> bool:
         return False
 
 
-def _sign_challenge(private_key_path: Path, challenge: bytes) -> bytes:
+def _sign_challenge(private_key_path: Path, challenge):
     """
     Sign challenge with client's private key.
     Returns signature bytes.
@@ -370,7 +467,267 @@ def _sign_challenge(private_key_path: Path, challenge: bytes) -> bytes:
         return b""
 
 
-def tcp_handshake_client(host_ip, pin=None):
+def _get_client_paths():
+    """Get paths for client certificates and keys."""
+    try:
+        client_dir = Path.home() / ".linuxplay"
+    except Exception:
+        client_dir = Path.home() / ".linuxplay"
+
+    return (
+        client_dir,
+        client_dir / "client_cert.pem",
+        client_dir / "client_key.pem",
+        client_dir / "host_ca.pem",
+    )
+
+
+def _handle_challenge_response(sock, cert_path, key_path, ca_path, host_ip):  # noqa: PLR0911
+    """Handle challenge-response authentication with existing certificate.
+
+    Returns: (success: bool, result: tuple | None)
+    """
+    logging.info("[AUTH] Attempting secure challenge-response authentication")
+    try:
+        # Validate host CA fingerprint (TOFU)
+        ca_pem = ca_path.read_bytes()
+        if not _validate_host_ca_fingerprint(ca_pem, host_ip):
+            logging.error("[AUTH] Host CA fingerprint validation failed - possible MITM!")
+            _show_error(
+                "Security Error",
+                f"Host CA fingerprint mismatch for {host_ip}!\nPossible Man-in-the-Middle attack.",
+            )
+            return (False, None)
+
+        # Try new challenge-response protocol
+        fp_hex = _read_pem_cert_fingerprint(cert_path)
+        sock.sendall(f"AUTH CERT:{fp_hex}".encode())
+        resp = sock.recv(2048).decode("utf-8", errors="replace").strip()
+
+        # Handle non-challenge responses
+        if resp.startswith("FAIL:DEPRECATED"):
+            logging.warning("[AUTH] Host requires protocol upgrade - falling back to legacy")
+            return (None, "deprecated")
+        if resp.startswith("BUSY"):
+            logging.error("Host is already in a session")
+            _show_error("Host Busy", "The host is already connected to another client.")
+            return (False, None)
+        if not resp.startswith("CHALLENGE:"):
+            return (None, "failed")
+
+        # Process challenge
+        challenge_b64 = resp[10:]
+        challenge = base64.b64decode(challenge_b64)
+
+        # Sign challenge
+        signature = _sign_challenge(key_path, challenge)
+        if not signature:
+            raise Exception("Failed to sign challenge")
+
+        # Send signature
+        sig_b64 = base64.b64encode(signature).decode()
+        sock.sendall(f"SIGNATURE:{sig_b64}".encode())
+
+        # Receive result
+        final_resp = sock.recv(2048).decode("utf-8", errors="replace").strip()
+
+        if final_resp.startswith("OK:"):
+            parts = final_resp.split(":", PROTOCOL_MIN_PARTS)
+            host_encoder = parts[1].strip()
+            monitor_info = parts[2].strip() if len(parts) > PROTOCOL_MIN_PARTS else DEFAULT_RESOLUTION
+            CLIENT_STATE["connected"] = True
+            CLIENT_STATE["last_heartbeat"] = time.time()
+            logging.info("[AUTH] ✓ Authenticated via challenge-response (SECURE)")
+            return (True, (host_encoder, monitor_info))
+
+        if final_resp.startswith("FAIL:DEPRECATED"):
+            logging.warning("[AUTH] Host requires upgrade to new protocol")
+            return (None, "deprecated")
+
+        logging.warning("[AUTH] Challenge-response failed: %s", final_resp)
+
+    except Exception as e:
+        logging.debug("[AUTH] Secure auth failed (%s), trying legacy", e)
+        return (None, "error")
+
+    return (None, "failed")
+
+
+def _handle_csr_submission(sock, key_path, cert_path, ca_path, host_ip, pin):  # noqa: PLR0911, PLR0913
+    """Handle CSR submission for first-time authentication.
+
+    Returns: (success: bool, result: tuple | None)
+    """
+    logging.info("[AUTH] No certificates found - using CSR flow (first-time secure auth)")
+
+    # Get PIN
+    code = (pin or "").strip()
+    if not code or len(code) != PIN_LENGTH or not code.isdigit():
+        code = _ask_pin()
+        if not code or not code.isdigit() or len(code) != PIN_LENGTH:
+            logging.error("PIN entry cancelled or invalid")
+            _show_error("Invalid PIN", "PIN entry was cancelled or invalid.")
+            return (False, None)
+
+    try:
+        # Send CSR request with PIN
+        sock.sendall(f"AUTH CSR {code}".encode())
+        resp = sock.recv(2048).decode("utf-8", errors="replace").strip()
+
+        # Handle error responses
+        if resp.startswith("FAIL:BADPIN"):
+            logging.error("Incorrect or expired PIN")
+            _show_error("Authentication Failed", "The PIN is incorrect or expired.")
+            return (False, None)
+        if resp.startswith("FAIL:RATELIMIT"):
+            logging.error("Rate limited: %s", resp)
+            _show_error("Rate Limited", "Too many failed attempts. Please wait.")
+            return (False, None)
+        if resp.startswith("BUSY"):
+            logging.error("Host is already in a session")
+            _show_error("Host Busy", "The host is already connected to another client.")
+            return (False, None)
+        if resp != "SENDCSR":
+            logging.error("[AUTH] Unexpected response: %s", resp)
+            return (None, "failed")
+
+        # Generate and send CSR
+        client_id = f"linuxplay-{socket.gethostname()}"
+        csr_pem = _generate_csr(key_path, client_id)
+        if not csr_pem:
+            raise Exception("Failed to generate CSR")
+
+        csr_b64 = base64.b64encode(csr_pem).decode()
+        sock.sendall(f"CSR:{csr_b64}".encode())
+
+        # Receive certificate
+        cert_resp = sock.recv(16384).decode("utf-8", errors="replace").strip()
+
+        if not cert_resp.startswith("CERT:"):
+            logging.error("[AUTH] CSR flow failed: %s", cert_resp)
+            return (None, "failed")
+
+        cert_data = cert_resp[5:]
+        parts = cert_data.split("|")
+        if len(parts) != 2:
+            raise Exception("Invalid certificate response")
+
+        cert_b64, ca_b64 = parts
+        cert_pem = base64.b64decode(cert_b64)
+        ca_pem = base64.b64decode(ca_b64)
+
+        # Save certificates
+        client_dir = cert_path.parent
+        client_dir.mkdir(parents=True, exist_ok=True)
+        cert_path.write_bytes(cert_pem)
+        ca_path.write_bytes(ca_pem)
+        cert_path.chmod(0o600)
+        ca_path.chmod(0o600)
+
+        # Validate and pin CA
+        if not _validate_host_ca_fingerprint(ca_pem, host_ip):
+            logging.error("[AUTH] CA fingerprint validation failed after issuance!")
+            return (False, None)
+
+        # Receive final OK
+        final_resp = sock.recv(2048).decode("utf-8", errors="replace").strip()
+        if final_resp.startswith("OK:"):
+            parts = final_resp.split(":", 2)
+            host_encoder = parts[1].strip()
+            monitor_info = parts[2].strip() if len(parts) > 2 else DEFAULT_RESOLUTION
+            CLIENT_STATE["connected"] = True
+            CLIENT_STATE["last_heartbeat"] = time.time()
+            logging.info("[AUTH] ✓ Authenticated via CSR (SECURE - first time)")
+            _show_info(
+                "Certificate Issued",
+                "Client certificate issued successfully!\nFuture connections will use secure authentication.",
+            )
+            return (True, (host_encoder, monitor_info))
+
+        logging.error("[AUTH] Final OK not received: %s", final_resp)
+
+    except Exception as e:
+        logging.error("[AUTH] CSR flow failed: %s", e)
+        return (None, "error")
+
+    return (None, "failed")
+
+
+def _handle_legacy_fingerprint_auth(sock, cert_path):
+    """Handle legacy fingerprint-only authentication.
+
+    Returns: (success: bool, result: tuple | None)
+    """
+    logging.warning("[AUTH] Falling back to LEGACY fingerprint-only auth (DEPRECATED)")
+    try:
+        fp_hex = _read_pem_cert_fingerprint(cert_path)
+        if fp_hex:
+            sock.sendall(f"HELLO CERTFP:{fp_hex}".encode())
+            resp = sock.recv(2048).decode("utf-8", errors="replace").strip()
+
+            if resp.startswith("OK:"):
+                parts = resp.split(":", 2)
+                host_encoder = parts[1].strip()
+                monitor_info = parts[2].strip() if len(parts) > 2 else DEFAULT_RESOLUTION
+                CLIENT_STATE["connected"] = True
+                CLIENT_STATE["last_heartbeat"] = time.time()
+                logging.warning("[AUTH] ✓ Authenticated via fingerprint (LEGACY - insecure)")
+                return (True, (host_encoder, monitor_info))
+
+            logging.warning("[AUTH] Legacy fingerprint auth failed: %s", resp)
+    except Exception as e:
+        logging.debug("[AUTH] Legacy fingerprint auth error: %s", e)
+
+    return (None, "failed")
+
+
+def _handle_legacy_pin_auth(sock, pin):
+    """Handle legacy PIN-only authentication.
+
+    Returns: (success: bool, result: tuple | None)
+    """
+    logging.warning("[AUTH] Falling back to LEGACY PIN-only auth (INSECURE)")
+    code = (pin or "").strip()
+    if not code or len(code) != 6 or not code.isdigit():
+        code = _ask_pin()
+        if not code or not code.isdigit() or len(code) != 6:
+            logging.error("PIN entry cancelled or invalid")
+            _show_error("Invalid PIN", "PIN entry was cancelled or invalid.")
+            return (False, None)
+
+    sock.sendall(f"HELLO {code}".encode())
+    resp = sock.recv(2048).decode("utf-8", errors="replace").strip()
+
+    if resp.startswith("OK:"):
+        parts = resp.split(":", 2)
+        host_encoder = parts[1].strip()
+        monitor_info = parts[2].strip() if len(parts) > 2 else DEFAULT_RESOLUTION
+        CLIENT_STATE["connected"] = True
+        CLIENT_STATE["last_heartbeat"] = time.time()
+        logging.warning("[AUTH] ✓ Authenticated via PIN-only (LEGACY - insecure)")
+        return (True, (host_encoder, monitor_info))
+
+    if resp.startswith("BUSY"):
+        logging.error("Host is already in a session")
+        _show_error("Host Busy", "The host is already connected to another client.")
+        return (False, None)
+
+    if resp.startswith("FAIL:BADPIN"):
+        logging.error("Incorrect or expired PIN")
+        _show_error("Authentication Failed", "The PIN is incorrect or expired.")
+        return (False, None)
+
+    if resp.startswith("FAIL:RATELIMIT"):
+        logging.error("Rate limited")
+        _show_error("Rate Limited", "Too many failed attempts. Please wait.")
+        return (False, None)
+
+    logging.error("Unexpected handshake response: %s", resp)
+    _show_error("Handshake Error", f"Unexpected response from host:\n{resp}")
+    return (False, None)
+
+
+def tcp_handshake_client(host_ip: str, pin: str | None = None) -> tuple[bool, tuple | None]:
     """
     Authenticate with host using new secure protocol.
 
@@ -379,262 +736,59 @@ def tcp_handshake_client(host_ip, pin=None):
     2. NEW: CSR submission with PIN (first-time secure auth)
     3. LEGACY: Fingerprint-only (deprecated, for old hosts)
     4. LEGACY: PIN-only (deprecated, insecure)
+
+    Args:
+        host_ip: Host IP address to connect to
+        pin: Optional 6-digit PIN for first-time auth
+
+    Returns:
+        Tuple of (success: bool, result: tuple[encoder, monitor_info] | None)
     """
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.settimeout(10)  # Increased timeout for crypto operations
+    sock.settimeout(15)  # Increased timeout for crypto operations (was 10s)
 
     try:
         logging.info("Handshake to %s:%s", host_ip, TCP_HANDSHAKE_PORT)
         sock.connect((host_ip, TCP_HANDSHAKE_PORT))
 
-        # Determine client paths
-        try:
-            client_dir = Path.home() / ".linuxplay"
-        except Exception:
-            client_dir = Path.home() / ".linuxplay"
-
-        cert_path = client_dir / "client_cert.pem"
-        key_path = client_dir / "client_key.pem"
-        ca_path = client_dir / "host_ca.pem"
+        # Get client paths
+        _, cert_path, key_path, ca_path = _get_client_paths()
 
         # Ensure client has keypair
         _ensure_client_keypair(key_path)
 
         # PATH 1: NEW SECURE - Challenge-response with existing cert
         if cert_path.exists() and key_path.exists() and ca_path.exists():
-            logging.info("[AUTH] Attempting secure challenge-response authentication")
-            try:
-                # Validate host CA fingerprint (TOFU)
-                ca_pem = ca_path.read_bytes()
-                if not _validate_host_ca_fingerprint(ca_pem, host_ip):
-                    logging.error("[AUTH] Host CA fingerprint validation failed - possible MITM!")
-                    _show_error(
-                        "Security Error",
-                        f"Host CA fingerprint mismatch for {host_ip}!\nPossible Man-in-the-Middle attack.",
-                    )
-                    sock.close()
-                    return (False, None)
+            result = _handle_challenge_response(sock, cert_path, key_path, ca_path, host_ip)
+            if result[0] is not None:  # Definitive result (success or failure)
+                sock.close()
+                return result
 
-                # Try new challenge-response protocol
-                fp_hex = _read_pem_cert_fingerprint(cert_path)
-                sock.sendall(f"AUTH CERT:{fp_hex}".encode())
-                resp = sock.recv(2048).decode("utf-8", errors="replace").strip()
-
-                if resp.startswith("CHALLENGE:"):
-                    challenge_b64 = resp[10:]
-                    challenge = base64.b64decode(challenge_b64)
-
-                    # Sign challenge
-                    signature = _sign_challenge(key_path, challenge)
-                    if not signature:
-                        raise Exception("Failed to sign challenge")
-
-                    # Send signature
-                    sig_b64 = base64.b64encode(signature).decode()
-                    sock.sendall(f"SIGNATURE:{sig_b64}".encode())
-
-                    # Receive result
-                    final_resp = sock.recv(2048).decode("utf-8", errors="replace").strip()
-
-                    if final_resp.startswith("OK:"):
-                        parts = final_resp.split(":", 2)
-                        host_encoder = parts[1].strip()
-                        monitor_info = parts[2].strip() if len(parts) > 2 else DEFAULT_RESOLUTION
-                        sock.close()
-                        CLIENT_STATE["connected"] = True
-                        CLIENT_STATE["last_heartbeat"] = time.time()
-                        logging.info("[AUTH] ✓ Authenticated via challenge-response (SECURE)")
-                        return (True, (host_encoder, monitor_info))
-
-                    if final_resp.startswith("FAIL:DEPRECATED"):
-                        logging.warning("[AUTH] Host requires upgrade to new protocol")
-                        # Fall through to legacy
-                    else:
-                        logging.warning("[AUTH] Challenge-response failed: %s", final_resp)
-
-                elif resp.startswith("FAIL:DEPRECATED"):
-                    logging.warning("[AUTH] Host requires protocol upgrade - falling back to legacy")
-                    # Fall through to legacy fingerprint auth
-
-                elif resp.startswith("BUSY"):
-                    logging.error("Host is already in a session")
-                    _show_error("Host Busy", "The host is already connected to another client.")
-                    sock.close()
-                    return (False, None)
-
-            except Exception as e:
-                logging.debug("[AUTH] Secure auth failed (%s), trying legacy", e)
-                # Reconnect for legacy attempt
-                with contextlib.suppress(Exception):
-                    sock.close()
-                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                sock.settimeout(10)
-                sock.connect((host_ip, TCP_HANDSHAKE_PORT))
+            # Need to reconnect for legacy attempt
+            with contextlib.suppress(Exception):
+                sock.close()
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(10)
+            sock.connect((host_ip, TCP_HANDSHAKE_PORT))
 
         # PATH 2: NEW SECURE - CSR submission (first time with this client)
         if not cert_path.exists() or not ca_path.exists():
-            logging.info("[AUTH] No certificates found - using CSR flow (first-time secure auth)")
-
-            # Get PIN
-            code = (pin or "").strip()
-            if not code or len(code) != 6 or not code.isdigit():
-                code = _ask_pin()
-                if not code or not code.isdigit() or len(code) != 6:
-                    sock.close()
-                    logging.error("PIN entry cancelled or invalid")
-                    _show_error("Invalid PIN", "PIN entry was cancelled or invalid.")
-                    return (False, None)
-
-            try:
-                # Send CSR request with PIN
-                sock.sendall(f"AUTH CSR {code}".encode())
-                resp = sock.recv(2048).decode("utf-8", errors="replace").strip()
-
-                if resp == "SENDCSR":
-                    # Generate and send CSR
-                    client_id = f"linuxplay-{socket.gethostname()}"
-                    csr_pem = _generate_csr(key_path, client_id)
-                    if not csr_pem:
-                        raise Exception("Failed to generate CSR")
-
-                    csr_b64 = base64.b64encode(csr_pem).decode()
-                    sock.sendall(f"CSR:{csr_b64}".encode())
-
-                    # Receive certificate
-                    cert_resp = sock.recv(16384).decode("utf-8", errors="replace").strip()
-
-                    if cert_resp.startswith("CERT:"):
-                        cert_data = cert_resp[5:]
-                        parts = cert_data.split("|")
-                        if len(parts) != 2:
-                            raise Exception("Invalid certificate response")
-
-                        cert_b64, ca_b64 = parts
-                        cert_pem = base64.b64decode(cert_b64)
-                        ca_pem = base64.b64decode(ca_b64)
-
-                        # Save certificates
-                        client_dir.mkdir(parents=True, exist_ok=True)
-                        cert_path.write_bytes(cert_pem)
-                        ca_path.write_bytes(ca_pem)
-                        cert_path.chmod(0o600)
-                        ca_path.chmod(0o600)
-
-                        # Validate and pin CA
-                        if not _validate_host_ca_fingerprint(ca_pem, host_ip):
-                            logging.error("[AUTH] CA fingerprint validation failed after issuance!")
-                            sock.close()
-                            return (False, None)
-
-                        # Receive final OK
-                        final_resp = sock.recv(2048).decode("utf-8", errors="replace").strip()
-                        if final_resp.startswith("OK:"):
-                            parts = final_resp.split(":", 2)
-                            host_encoder = parts[1].strip()
-                            monitor_info = parts[2].strip() if len(parts) > 2 else DEFAULT_RESOLUTION
-                            sock.close()
-                            CLIENT_STATE["connected"] = True
-                            CLIENT_STATE["last_heartbeat"] = time.time()
-                            logging.info("[AUTH] ✓ Authenticated via CSR (SECURE - first time)")
-                            _show_info(
-                                "Certificate Issued",
-                                "Client certificate issued successfully!\nFuture connections will use secure authentication.",
-                            )
-                            return (True, (host_encoder, monitor_info))
-
-                    logging.error("[AUTH] CSR flow failed: %s", cert_resp)
-
-                elif resp.startswith("FAIL:BADPIN"):
-                    logging.error("Incorrect or expired PIN")
-                    _show_error("Authentication Failed", "The PIN is incorrect or expired.")
-                    sock.close()
-                    return (False, None)
-
-                elif resp.startswith("FAIL:RATELIMIT"):
-                    logging.error("Rate limited: %s", resp)
-                    _show_error("Rate Limited", "Too many failed attempts. Please wait.")
-                    sock.close()
-                    return (False, None)
-
-                elif resp.startswith("BUSY"):
-                    logging.error("Host is already in a session")
-                    _show_error("Host Busy", "The host is already connected to another client.")
-                    sock.close()
-                    return (False, None)
-
-            except Exception as e:
-                logging.error("[AUTH] CSR flow failed: %s", e)
-                # Fall through to legacy
+            result = _handle_csr_submission(sock, key_path, cert_path, ca_path, host_ip, pin)
+            if result[0] is not None:  # Definitive result
+                sock.close()
+                return result
 
         # PATH 3: LEGACY - Fingerprint-only (deprecated)
         if cert_path.exists() and key_path.exists():
-            logging.warning("[AUTH] Falling back to LEGACY fingerprint-only auth (DEPRECATED)")
-            try:
-                fp_hex = _read_pem_cert_fingerprint(cert_path)
-                if fp_hex:
-                    sock.sendall(f"HELLO CERTFP:{fp_hex}".encode())
-                    resp = sock.recv(2048).decode("utf-8", errors="replace").strip()
-
-                    if resp.startswith("OK:"):
-                        parts = resp.split(":", 2)
-                        host_encoder = parts[1].strip()
-                        monitor_info = parts[2].strip() if len(parts) > 2 else DEFAULT_RESOLUTION
-                        sock.close()
-                        CLIENT_STATE["connected"] = True
-                        CLIENT_STATE["last_heartbeat"] = time.time()
-                        logging.warning("[AUTH] ✓ Authenticated via fingerprint (LEGACY - insecure)")
-                        return (True, (host_encoder, monitor_info))
-
-                    logging.warning("[AUTH] Legacy fingerprint auth failed: %s", resp)
-            except Exception as e:
-                logging.debug("[AUTH] Legacy fingerprint auth error: %s", e)
+            result = _handle_legacy_fingerprint_auth(sock, cert_path)
+            if result[0] is not None:
+                sock.close()
+                return result
 
         # PATH 4: LEGACY - PIN-only (most insecure)
-        logging.warning("[AUTH] Falling back to LEGACY PIN-only auth (INSECURE)")
-        code = (pin or "").strip()
-        if not code or len(code) != 6 or not code.isdigit():
-            code = _ask_pin()
-            if not code or not code.isdigit() or len(code) != 6:
-                sock.close()
-                logging.error("PIN entry cancelled or invalid")
-                _show_error("Invalid PIN", "PIN entry was cancelled or invalid.")
-                return (False, None)
-
-        sock.sendall(f"HELLO {code}".encode())
-        resp = sock.recv(2048).decode("utf-8", errors="replace").strip()
-
-        if resp.startswith("OK:"):
-            parts = resp.split(":", 2)
-            host_encoder = parts[1].strip()
-            monitor_info = parts[2].strip() if len(parts) > 2 else DEFAULT_RESOLUTION
-            sock.close()
-            CLIENT_STATE["connected"] = True
-            CLIENT_STATE["last_heartbeat"] = time.time()
-            logging.warning("[AUTH] ✓ Authenticated via PIN-only (LEGACY - insecure)")
-            return (True, (host_encoder, monitor_info))
-
-        if resp.startswith("BUSY"):
-            logging.error("Host is already in a session")
-            _show_error("Host Busy", "The host is already connected to another client.")
-            sock.close()
-            return (False, None)
-
-        if resp.startswith("FAIL:BADPIN"):
-            logging.error("Incorrect or expired PIN")
-            _show_error("Authentication Failed", "The PIN is incorrect or expired.")
-            sock.close()
-            return (False, None)
-
-        if resp.startswith("FAIL:RATELIMIT"):
-            logging.error("Rate limited")
-            _show_error("Rate Limited", "Too many failed attempts. Please wait.")
-            sock.close()
-            return (False, None)
-
-        logging.error("Unexpected handshake response: %s", resp)
-        _show_error("Handshake Error", f"Unexpected response from host:\n{resp}")
+        result = _handle_legacy_pin_auth(sock, pin)
         sock.close()
-        return (False, None)
+        return result
 
     except Exception as e:
         logging.error("Handshake failed: %s", e)
@@ -644,10 +798,26 @@ def tcp_handshake_client(host_ip, pin=None):
         return (False, None)
 
 
-def heartbeat_responder(host_ip):
+def heartbeat_responder(host_ip: str) -> threading.Thread:
+    """Start heartbeat responder thread for connection keepalive.
+
+    Returns:
+        Started daemon thread (automatically cleaned up on exit)
+    """
+
     def loop():
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            # Optimize for heartbeat responsiveness
+            try:
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, UDP_RECV_BUFFER_SIZE)
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, UDP_RECV_BUFFER_SIZE)
+                if IS_LINUX:
+                    # SO_BUSY_POLL for ultra-low latency
+                    with contextlib.suppress(OSError):
+                        sock.setsockopt(socket.SOL_SOCKET, 46, UDP_BUSY_POLL_USEC)  # SO_BUSY_POLL=46
+            except OSError as e:
+                logging.debug(f"Heartbeat socket optimization failed (non-critical): {e}")
             # No bind() - use ephemeral port for outbound connection
             sock.settimeout(2)
             logging.info("Heartbeat responder active (outbound-only, no firewall port needed)")
@@ -668,11 +838,13 @@ def heartbeat_responder(host_ip):
                         # Reply to host
                         sock.sendto(b"PONG", host_addr)
                         CLIENT_STATE["last_heartbeat"] = time.time()
-                except TimeoutError:  # noqa: PERF203
-                    if time.time() - CLIENT_STATE["last_heartbeat"] > 10:
+                except TimeoutError:
+                    if time.time() - CLIENT_STATE["last_heartbeat"] > HEARTBEAT_TIMEOUT_SECS:
                         CLIENT_STATE["connected"] = False
                         CLIENT_STATE["reconnecting"] = True
-                except Exception:
+                        logging.warning("Heartbeat timeout after %ds", HEARTBEAT_TIMEOUT_SECS)
+                except Exception as e:
+                    logging.debug(f"Heartbeat error: {e}")
                     time.sleep(0.2)
                     continue
 
@@ -681,10 +853,22 @@ def heartbeat_responder(host_ip):
     return t
 
 
-def clipboard_listener(app_clipboard, host_ip):
+def clipboard_listener(app_clipboard, host_ip: str) -> threading.Thread:
+    """Start clipboard sync thread.
+
+    Returns:
+        Started daemon thread (automatically cleaned up on exit)
+    """
+
     def loop():
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            # Optimize for clipboard data transfer
+            try:
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, UDP_RECV_BUFFER_SIZE)
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, UDP_RECV_BUFFER_SIZE)
+            except OSError as e:
+                logging.debug(f"Clipboard socket optimization failed (non-critical): {e}")
             # No bind() - use ephemeral port for receiving on same socket used for sending
             sock.settimeout(2)
             logging.info("Clipboard listener active (outbound-only, no firewall port needed)")
@@ -723,7 +907,13 @@ def clipboard_listener(app_clipboard, host_ip):
     return t
 
 
-def audio_listener(host_ip):
+def audio_listener(host_ip: str) -> threading.Thread:
+    """Start audio playback thread using ffplay.
+
+    Returns:
+        Started daemon thread (automatically cleaned up on exit)
+    """
+
     def loop():
         cmd = [
             "ffplay",
@@ -747,12 +937,19 @@ def audio_listener(host_ip):
             audio_proc_manager.proc = subprocess.Popen(
                 cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True
             )
+            # Log audio stream detection
             for line in audio_proc_manager.proc.stdout:
                 if "Stream #" in line and "Audio" in line:
                     logging.info(line.strip())
-            audio_proc_manager.proc.wait()
+
+            # Wait for process to complete
+            ret = audio_proc_manager.proc.wait()
+            if ret != 0:
+                logging.warning(f"ffplay exited with code {ret}")
         except Exception as e:
             logging.error("Audio listener failed: %s", e)
+        finally:
+            audio_proc_manager.proc = None
 
     t = threading.Thread(target=loop, daemon=True)
     t.start()
@@ -791,127 +988,147 @@ class DecoderThread(QThread):
         logging.debug("Opening stream with opts: %s", self.decoder_opts)
         return av.open(self.input_url, format="mpegts", options=self.decoder_opts)
 
+    def _setup_codec_context(self, cc):
+        """Configure codec context for low-latency decoding."""
+        cc.thread_count = 1 if self.ultra else 2
+
+        for attr, value in (
+            ("low_delay", True),
+            ("skip_frame", "NONREF"),
+            ("has_b_frames", False),
+            ("strict_std_compliance", "experimental"),
+            ("framerate", None),
+            ("delay", 0),
+        ):
+            with contextlib.suppress(Exception):
+                setattr(cc, attr, value)
+
+        with contextlib.suppress(Exception):
+            cc.flags2 = "+fast"
+
+    def _init_hardware_decode(self, cc):
+        """Initialize hardware decode context if available."""
+        hw_device = getattr(cc, "hw_device_ctx", None)
+        if hw_device is not None or "hwaccel" not in self.decoder_opts:
+            return
+
+        hw_type = self.decoder_opts["hwaccel"]
+        dev = self.decoder_opts.get("hwaccel_device", None)
+
+        hw_type_map = {
+            "vaapi": "vaapi",
+            "nvdec": "cuda",
+            "cuda": "cuda",
+            "qsv": "qsv",
+            "d3d11va": "d3d11va",
+            "dxva2": "dxva2",
+        }
+        hw_type_norm = hw_type_map.get(hw_type, hw_type)
+
+        try:
+            if not hasattr(av, "HwDeviceContext"):
+                logging.warning(f"PyAV build lacks HwDeviceContext; using software decode for {hw_type_norm}.")
+                self._hw_name = "CPU"
+                self.decoder_opts.pop("hwaccel", None)
+                self.decoder_opts.pop("hwaccel_device", None)
+                return
+
+            if not dev:
+                if hw_type_norm == "vaapi":
+                    dev = "/dev/dri/renderD128"
+                elif hw_type_norm in ("cuda", "nvdec"):
+                    dev = "cuda"
+
+            hw_ctx = av.HwDeviceContext.create(hw_type_norm, device=dev)
+            cc.hw_device_ctx = hw_ctx
+            self._hw_name = hw_type_norm
+            logging.info(f"DecoderThread: Using hardware decode via {hw_type_norm} ({dev or 'auto'})")
+        except Exception as e:
+            logging.warning(f"Hardware decode init failed for {hw_type_norm}: {e}")
+            self._hw_name = "CPU"
+            self.decoder_opts.pop("hwaccel", None)
+            self.decoder_opts.pop("hwaccel_device", None)
+
+    def _extract_dmabuf_fd(self, frame):
+        """Extract DMA-BUF file descriptor from hardware frame if available."""
+        try:
+            if not frame.hw_frames_ctx:
+                return None
+            if not hasattr(frame, "planes") or not frame.planes:
+                return None
+
+            p = frame.planes[0]
+            if hasattr(p, "fd"):
+                return p.fd
+            if hasattr(p, "buffer_ptr") and isinstance(p.buffer_ptr, int):
+                return p.buffer_ptr
+        except Exception:
+            pass
+        return None
+
+    def _process_frame(self, frame, t_decode):
+        """Process and emit a decoded frame."""
+        if not self._running or not frame or frame.is_corrupt:
+            return False
+
+        t0 = time.perf_counter()
+        dmabuf_fd = self._extract_dmabuf_fd(frame)
+
+        if dmabuf_fd is not None:
+            self._has_first_frame = True
+            self.frame_ready.emit(("dmabuf", dmabuf_fd, frame.width, frame.height))
+        else:
+            arr = frame.to_ndarray(format="rgb24")
+            if not arr.flags["C_CONTIGUOUS"]:
+                arr = np.ascontiguousarray(arr, dtype=np.uint8)
+            self._has_first_frame = True
+            self.frame_ready.emit((arr, frame.width, frame.height))
+
+        t1 = time.perf_counter()
+        self._frame_count += 1
+        decode_time = (t1 - t0) * 1000
+        self._avg_decode_time = (
+            0.9 * self._avg_decode_time + 0.1 * decode_time if self._frame_count > 1 else decode_time
+        )
+
+        if len(t_decode) < 120:
+            t_decode.append(decode_time)
+        else:
+            avg = statistics.mean(t_decode)
+            logging.debug(f"Avg decode time: {avg:.2f} ms ({self._hw_name or 'CPU'})")
+            t_decode.clear()
+
+        if self._emit_interval > 0:
+            elapsed = time.time() - self._last_emit
+            if elapsed < self._emit_interval:
+                return False
+        self._last_emit = time.time()
+        return True
+
+    def _decode_loop(self, container):
+        """Main decode loop for processing video frames."""
+        vstream = next((s for s in container.streams if s.type == "video"), None)
+        if not vstream:
+            logging.warning("No video stream detected, retrying...")
+            time.sleep(0.5)
+            return
+
+        cc = vstream.codec_context
+        self._setup_codec_context(cc)
+        self._init_hardware_decode(cc)
+
+        t_decode = []
+        for frame in container.decode(video=0):
+            if not self._running:
+                break
+            self._process_frame(frame, t_decode)
+
     def run(self):
         while self._running:
             container = None
             try:
                 container = self._open_container()
-                vstream = next((s for s in container.streams if s.type == "video"), None)
-                if not vstream:
-                    logging.warning("No video stream detected, retrying...")
-                    time.sleep(0.5)
-                    continue
-
-                cc = vstream.codec_context
-                cc.thread_count = 1 if self.ultra else 2
-
-                for attr, value in (
-                    ("low_delay", True),
-                    ("skip_frame", "NONREF"),
-                    ("has_b_frames", False),
-                    ("strict_std_compliance", "experimental"),
-                    ("framerate", None),
-                    ("delay", 0),
-                ):
-                    with contextlib.suppress(Exception):
-                        setattr(cc, attr, value)
-
-                with contextlib.suppress(Exception):
-                    cc.flags2 = "+fast"
-
-                hw_device = getattr(cc, "hw_device_ctx", None)
-                if hw_device is None and "hwaccel" in self.decoder_opts:
-                    hw_type = self.decoder_opts["hwaccel"]
-                    dev = self.decoder_opts.get("hwaccel_device", None)
-
-                    hw_type_map = {
-                        "vaapi": "vaapi",
-                        "nvdec": "cuda",
-                        "cuda": "cuda",
-                        "qsv": "qsv",
-                        "d3d11va": "d3d11va",
-                        "dxva2": "dxva2",
-                    }
-                    hw_type_norm = hw_type_map.get(hw_type, hw_type)
-
-                    try:
-                        if hasattr(av, "HwDeviceContext"):
-                            if not dev:
-                                if hw_type_norm == "vaapi":
-                                    dev = "/dev/dri/renderD128"
-                                elif hw_type_norm in ("cuda", "nvdec"):
-                                    dev = "cuda"
-                                else:
-                                    dev = None
-                            hw_ctx = av.HwDeviceContext.create(hw_type_norm, device=dev)
-                            cc.hw_device_ctx = hw_ctx
-                            self._hw_name = hw_type_norm
-                            logging.info(f"DecoderThread: Using hardware decode via {hw_type_norm} ({dev or 'auto'})")
-                        else:
-                            logging.warning(
-                                f"PyAV build lacks HwDeviceContext; using software decode for {hw_type_norm}."
-                            )
-                            self._hw_name = "CPU"
-                            self.decoder_opts.pop("hwaccel", None)
-                            self.decoder_opts.pop("hwaccel_device", None)
-                    except Exception as e:
-                        logging.warning(f"Hardware decode init failed for {hw_type_norm}: {e}")
-                        self._hw_name = "CPU"
-                        self.decoder_opts.pop("hwaccel", None)
-                        self.decoder_opts.pop("hwaccel_device", None)
-
-                t_decode = []
-
-                for frame in container.decode(video=0):
-                    if not self._running:
-                        break
-                    if not frame or frame.is_corrupt:
-                        continue
-
-                    t0 = time.perf_counter()
-                    dmabuf_fd = None
-
-                    try:
-                        if frame.hw_frames_ctx:
-                            pass
-                        if hasattr(frame, "planes") and frame.planes:
-                            p = frame.planes[0]
-                            if hasattr(p, "fd"):
-                                dmabuf_fd = p.fd
-                            elif hasattr(p, "buffer_ptr") and isinstance(p.buffer_ptr, int):
-                                dmabuf_fd = p.buffer_ptr
-                    except Exception:
-                        dmabuf_fd = None
-
-                    if dmabuf_fd is not None:
-                        self._has_first_frame = True
-                        self.frame_ready.emit(("dmabuf", dmabuf_fd, frame.width, frame.height))
-                    else:
-                        arr = frame.to_ndarray(format="rgb24")
-                        if not arr.flags["C_CONTIGUOUS"]:
-                            arr = np.ascontiguousarray(arr, dtype=np.uint8)
-                        self._has_first_frame = True
-                        self.frame_ready.emit((arr, frame.width, frame.height))
-
-                    t1 = time.perf_counter()
-                    self._frame_count += 1
-                    decode_time = (t1 - t0) * 1000
-                    self._avg_decode_time = (
-                        0.9 * self._avg_decode_time + 0.1 * decode_time if self._frame_count > 1 else decode_time
-                    )
-
-                    if len(t_decode) < 120:
-                        t_decode.append(decode_time)
-                    else:
-                        avg = statistics.mean(t_decode)
-                        logging.debug(f"Avg decode time: {avg:.2f} ms ({self._hw_name or 'CPU'})")
-                        t_decode.clear()
-
-                    if self._emit_interval > 0:
-                        elapsed = time.time() - self._last_emit
-                        if elapsed < self._emit_interval:
-                            continue
-                    self._last_emit = time.time()
+                self._decode_loop(container)
 
                 if self._running:
                     if not self._has_first_frame:
@@ -1186,7 +1403,7 @@ def pick_best_renderer():
 
 
 class VideoWidgetGL(QOpenGLWidget):
-    def __init__(self, control_callback, rwidth, rheight, offset_x, offset_y, host_ip, parent=None):
+    def __init__(self, control_callback, rwidth, rheight, offset_x, offset_y, host_ip, parent=None):  # noqa: PLR0913
         super().__init__(parent)
         self.setMouseTracking(True)
         self.setFocusPolicy(Qt.StrongFocus)
@@ -1250,11 +1467,16 @@ class VideoWidgetGL(QOpenGLWidget):
             pass
 
     def initializeGL(self):
-        glDisable(GL_DEPTH_TEST)
-        glDisable(GL_DITHER)
-        glClearColor(0.0, 0.0, 0.0, 1.0)
-        self.texture_id = glGenTextures(1)
-        self._initialize_texture(self.texture_width, self.texture_height)
+        try:
+            glDisable(GL_DEPTH_TEST)
+            glDisable(GL_DITHER)
+            glClearColor(0.0, 0.0, 0.0, 1.0)
+            self.texture_id = glGenTextures(1)
+            self._initialize_texture(self.texture_width, self.texture_height)
+        except Exception as e:
+            logging.warning(f"OpenGL initialization deferred: {e}")
+            # Context will be ready on first paintGL call
+            self.texture_id = None
 
     def _initialize_texture(self, w, h):
         glBindTexture(GL_TEXTURE_2D, self.texture_id)
@@ -1519,6 +1741,15 @@ class GamepadThread(threading.Thread):
         self.path_hint = path_hint
         self._running = True
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        # Optimize gamepad socket for low-latency input
+        try:
+            self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, UDP_SEND_BUFFER_SIZE)
+            if IS_LINUX:
+                # SO_BUSY_POLL for gamepad input responsiveness
+                with contextlib.suppress(OSError):
+                    self.sock.setsockopt(socket.SOL_SOCKET, 46, UDP_BUSY_POLL_USEC)  # SO_BUSY_POLL=46
+        except OSError as e:
+            logging.debug(f"Gamepad socket optimization failed (non-critical): {e}")
 
     def _find_device(self):
         if not HAVE_EVDEV:
@@ -1610,7 +1841,7 @@ class GamepadThread(threading.Thread):
 
 
 class MainWindow(QMainWindow):
-    def __init__(
+    def __init__(  # noqa: PLR0913
         self,
         decoder_opts,
         rwidth,
@@ -1637,6 +1868,15 @@ class MainWindow(QMainWindow):
         self.control_addr = (host_ip, CONTROL_PORT)
         self.control_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.control_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        # Optimize control socket for low-latency mouse/keyboard input
+        try:
+            self.control_sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, UDP_SEND_BUFFER_SIZE)
+            if IS_LINUX:
+                # SO_BUSY_POLL for control input responsiveness
+                with contextlib.suppress(OSError):
+                    self.control_sock.setsockopt(socket.SOL_SOCKET, 46, UDP_BUSY_POLL_USEC)  # SO_BUSY_POLL=46
+        except OSError as e:
+            logging.debug(f"Control socket optimization failed (non-critical): {e}")
         self.control_sock.setblocking(False)
 
         try:
@@ -1866,45 +2106,196 @@ class MainWindow(QMainWindow):
             logging.error(f"Control send error: {e}")
 
     def closeEvent(self, event):
+        """Clean up resources on window close.
+
+        python.exe .\client.py --host_ip 192.168.1.128 --decoder h.264 --hwaccel auto --pin <CURRENT_PIN>        python.exe .\client.py --host_ip 192.168.1.128 --decoder h.264 --hwaccel auto --audio disable        Critical pattern: Always use timeouts on thread joins to prevent hangs.
+        """
         self._running = False
         CLIENT_STATE["connected"] = False
         logging.info("Closing client window…")
 
+        # Send goodbye message to host
         try:
             self.control_sock.sendto(b"GOODBYE", self.control_addr)
             logging.info("Sent GOODBYE to host")
         except Exception as e:
             logging.debug(f"GOODBYE send failed: {e}")
 
+        # Stop Qt timers
         for timer_name in ("clip_timer", "status_timer", "stats_timer"):
             timer = getattr(self, timer_name, None)
             if timer:
                 with contextlib.suppress(Exception):
                     timer.stop()
 
+        # Stop decoder thread with timeout
         if hasattr(self, "decoder_thread"):
             try:
                 self.decoder_thread.stop()
-                self.decoder_thread.wait(2000)
+                if not self.decoder_thread.wait(2000):  # 2s timeout
+                    logging.warning("Decoder thread did not stop cleanly")
             except Exception as e:
                 logging.debug(f"Decoder cleanup error: {e}")
 
+        # Stop gamepad thread
         if getattr(self, "_gp_thread", None):
             with contextlib.suppress(Exception):
                 self._gp_thread.stop()
+                # Thread is daemon, no need to join
 
+        # Terminate audio process with timeout
         if audio_proc_manager.proc:
             try:
                 audio_proc_manager.proc.terminate()
-                audio_proc_manager.proc.wait(timeout=2)
+                try:
+                    audio_proc_manager.proc.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    logging.warning("ffplay did not terminate, forcing kill")
+                    audio_proc_manager.proc.kill()
+                    audio_proc_manager.proc.wait(timeout=1)
             except Exception as e:
                 logging.error(f"ffplay term error: {e}")
-            audio_proc_manager.proc = None
+            finally:
+                audio_proc_manager.proc = None
 
+        # Close control socket
         with contextlib.suppress(Exception):
             self.control_sock.close()
 
         event.accept()
+
+
+def _setup_environment_vars():
+    """Clean environment and set up OpenGL/Qt configuration."""
+    for var in list(os.environ):
+        if var.startswith(("MESA_", "LIBGL_", "__GL_", "QT_LOGGING", "vblank_mode")):
+            del os.environ[var]
+
+    if IS_WINDOWS:
+        os.environ["QT_OPENGL"] = "angle"
+        os.environ["QT_ANGLE_PLATFORM"] = "d3d11"
+    else:
+        os.environ.setdefault("QT_OPENGL", "desktop")
+        os.environ.setdefault("QT_XCB_GL_INTEGRATION", "xcb_egl")
+
+
+def _setup_logging(debug: bool):
+    """Configure logging handlers."""
+    log_level = logging.DEBUG if debug else logging.INFO
+    log_format = "%(asctime)s [%(levelname)s] %(message)s"
+    log_datefmt = "%H:%M:%S"
+
+    root_logger = logging.getLogger()
+    root_logger.setLevel(log_level)
+    for h in list(root_logger.handlers):
+        root_logger.removeHandler(h)
+
+    console = logging.StreamHandler(sys.stdout)
+    console.setLevel(log_level)
+    console.setFormatter(logging.Formatter(log_format, datefmt=log_datefmt))
+    root_logger.addHandler(console)
+
+    try:
+        file_handler = logging.FileHandler("linuxplay_client.log", mode="w", encoding="utf-8")
+        file_handler.setLevel(log_level)
+        file_handler.setFormatter(logging.Formatter(log_format, datefmt=log_datefmt))
+        root_logger.addHandler(file_handler)
+    except Exception:
+        pass
+
+
+def _parse_monitor_info(monitor_info_str: str) -> list[tuple[int, int, int, int]]:
+    """Parse monitor information from handshake. Returns list of (w, h, ox, oy) tuples."""
+    try:
+        monitors = []
+        parts = [p for p in monitor_info_str.split(";") if p]
+        for part in parts:
+            if "+" in part:
+                res, ox, oy = part.split("+")
+                w, h = map(int, res.split("x"))
+                monitors.append((w, h, int(ox), int(oy)))
+            else:
+                w, h = map(int, part.split("x"))
+                monitors.append((w, h, 0, 0))
+        if not monitors:
+            raise ValueError
+        return monitors
+    except Exception:
+        logging.error("Monitor parse error, defaulting to %s", DEFAULT_RESOLUTION)
+        w, h = map(int, DEFAULT_RESOLUTION.split("x"))
+        return [(w, h, 0, 0)]
+
+
+def _setup_decoder_opts(hwaccel: str, ultra: bool) -> dict:
+    """Configure decoder options based on hardware acceleration and ultra mode."""
+    decoder_opts = {}
+    if hwaccel != "cpu":
+        decoder_opts["hwaccel"] = hwaccel
+        if hwaccel == "vaapi":
+            decoder_opts["hwaccel_device"] = "/dev/dri/renderD128"
+
+    if ultra:
+        decoder_opts.update(
+            {
+                "fflags": "nobuffer",
+                "flags": "low_delay",
+                "flags2": "+fast",
+                "probesize": "32",
+                "analyzeduration": "0",
+                "rtbufsize": "512k",
+                "threads": "1",
+                "skip_frame": "noref",
+            }
+        )
+    return decoder_opts
+
+
+def _create_windows(args, monitors: list, decoder_opts: dict, ultra: bool) -> list:
+    """Create MainWindow instances based on monitor selection."""
+    windows = []
+    if args.monitor.lower() == "all":
+        for i, (w, h, ox, oy) in enumerate(monitors):
+            win = MainWindow(
+                decoder_opts,
+                w,
+                h,
+                args.host_ip,
+                DEFAULT_UDP_PORT + i,
+                ox,
+                oy,
+                args.net if args.net != "auto" else "lan",
+                ultra=ultra,
+                gamepad=args.gamepad,
+                gamepad_dev=args.gamepad_dev,
+            )
+            win.setWindowTitle(f"LinuxPlay — Monitor {i}")
+            win.show()
+            windows.append(win)
+    else:
+        try:
+            idx = int(args.monitor)
+        except Exception:
+            idx = 0
+        if idx < 0 or idx >= len(monitors):
+            idx = 0
+        w, h, ox, oy = monitors[idx]
+        win = MainWindow(
+            decoder_opts,
+            w,
+            h,
+            args.host_ip,
+            DEFAULT_UDP_PORT + idx,
+            ox,
+            oy,
+            args.net if args.net != "auto" else "lan",
+            ultra=ultra,
+            gamepad=args.gamepad,
+            gamepad_dev=args.gamepad_dev,
+        )
+        win.setWindowTitle(f"LinuxPlay — Monitor {idx}")
+        win.show()
+        windows.append(win)
+    return windows
 
 
 def main():
@@ -1924,16 +2315,7 @@ def main():
     p.add_argument("--gamepad_dev", default=None)
     args = p.parse_args()
 
-    for var in list(os.environ):
-        if var.startswith(("MESA_", "LIBGL_", "__GL_", "QT_LOGGING", "vblank_mode")):
-            del os.environ[var]
-
-    if IS_WINDOWS:
-        os.environ["QT_OPENGL"] = "angle"
-        os.environ["QT_ANGLE_PLATFORM"] = "d3d11"
-    else:
-        os.environ.setdefault("QT_OPENGL", "desktop")
-        os.environ.setdefault("QT_XCB_GL_INTEGRATION", "xcb_egl")
+    _setup_environment_vars()
 
     fmt = QSurfaceFormat()
     fmt.setSwapInterval(0)
@@ -1948,27 +2330,7 @@ def main():
     except Exception:
         pass
 
-    LOG_LEVEL = logging.DEBUG if args.debug else logging.INFO
-    LOG_FORMAT = "%(asctime)s [%(levelname)s] %(message)s"
-    LOG_DATEFMT = "%H:%M:%S"
-
-    root_logger = logging.getLogger()
-    root_logger.setLevel(LOG_LEVEL)
-    for h in list(root_logger.handlers):
-        root_logger.removeHandler(h)
-
-    console = logging.StreamHandler(sys.stdout)
-    console.setLevel(LOG_LEVEL)
-    console.setFormatter(logging.Formatter(LOG_FORMAT, datefmt=LOG_DATEFMT))
-    root_logger.addHandler(console)
-
-    try:
-        file_handler = logging.FileHandler("linuxplay_client.log", mode="w", encoding="utf-8")
-        file_handler.setLevel(LOG_LEVEL)
-        file_handler.setFormatter(logging.Formatter(LOG_FORMAT, datefmt=LOG_DATEFMT))
-        root_logger.addHandler(file_handler)
-    except Exception:
-        pass
+    _setup_logging(args.debug)
 
     logging.info("────────────────────────────────────────────")
     logging.info("LinuxPlay Client starting up")
@@ -1997,94 +2359,20 @@ def main():
     if args.ultra and not ultra_active:
         logging.info("Ultra requested but disabled on %s; using safe buffering.", net_mode)
     elif ultra_active:
-        logging.info("Ultra mode enabled (LAN): minimal buffering, no B-frame reordering.")
+        logging.info(
+            "Ultra mode enabled (LAN): minimal buffering, no B-frame reordering. "
+            "For lowest latency, use H.264 codec (typically faster decode than H.265)."
+        )
 
-    try:
-        monitors = []
-        parts = [p for p in monitor_info_str.split(";") if p]
-        for part in parts:
-            if "+" in part:
-                res, ox, oy = part.split("+")
-                w, h = map(int, res.split("x"))
-                monitors.append((w, h, int(ox), int(oy)))
-            else:
-                w, h = map(int, part.split("x"))
-                monitors.append((w, h, 0, 0))
-        if not monitors:
-            raise ValueError
-    except Exception:
-        logging.error("Monitor parse error, defaulting to %s", DEFAULT_RESOLUTION)
-        w, h = map(int, DEFAULT_RESOLUTION.split("x"))
-        monitors = [(w, h, 0, 0)]
+    monitors = _parse_monitor_info(monitor_info_str)
 
     chosen = args.hwaccel
     if chosen == "auto":
         chosen = choose_auto_hwaccel()
     logging.info(f"HW accel selected: {chosen}")
 
-    decoder_opts = {}
-    if chosen != "cpu":
-        decoder_opts["hwaccel"] = chosen
-        if chosen == "vaapi":
-            decoder_opts["hwaccel_device"] = "/dev/dri/renderD128"
-
-    if ultra_active:
-        decoder_opts.update(
-            {
-                "fflags": "nobuffer",
-                "flags": "low_delay",
-                "flags2": "+fast",
-                "probesize": "32",
-                "analyzeduration": "0",
-                "rtbufsize": "512k",
-                "threads": "1",
-                "skip_frame": "noref",
-            }
-        )
-
-    windows = []
-    if args.monitor.lower() == "all":
-        for i, (w, h, ox, oy) in enumerate(monitors):
-            win = MainWindow(
-                decoder_opts,
-                w,
-                h,
-                args.host_ip,
-                DEFAULT_UDP_PORT + i,
-                ox,
-                oy,
-                net_mode,
-                ultra=ultra_active,
-                gamepad=args.gamepad,
-                gamepad_dev=args.gamepad_dev,
-            )
-            win.setWindowTitle(f"LinuxPlay — Monitor {i}")
-            win.show()
-            windows.append(win)
-    else:
-        try:
-            idx = int(args.monitor)
-        except Exception:
-            idx = 0
-        if idx < 0 or idx >= len(monitors):
-            idx = 0
-        w, h, ox, oy = monitors[idx]
-        win = MainWindow(
-            decoder_opts,
-            w,
-            h,
-            args.host_ip,
-            DEFAULT_UDP_PORT + idx,
-            ox,
-            oy,
-            net_mode,
-            ultra=ultra_active,
-            gamepad=args.gamepad,
-            gamepad_dev=args.gamepad_dev,
-        )
-        win.setWindowTitle(f"LinuxPlay — Monitor {idx}")
-        win.show()
-        windows.append(win)
+    decoder_opts = _setup_decoder_opts(chosen, ultra_active)
+    _create_windows(args, monitors, decoder_opts, ultra_active)
 
     ret = app.exec_()
 

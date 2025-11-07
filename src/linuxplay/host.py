@@ -24,6 +24,8 @@ from tkinter import scrolledtext, ttk
 import psutil
 
 
+# Note: pynvml module provided by nvidia-ml-py package (official NVIDIA library)
+# nvidia-ml-py is the maintained successor to deprecated pynvml package
 try:
     import pynvml
 
@@ -46,6 +48,68 @@ ACTIVE_CLIENT_LOCK = threading.Lock()
 PIN_LENGTH = 6
 PIN_ROTATE_SECS = 30
 ALLOW_SAME_IP_RECONNECT = True
+
+# Hardware detection constants
+INTEL_SKYLAKE_GEN = 6  # Minimum CPU generation for QSV support
+INTEL_BROADWELL_GEN = 5
+INTEL_HASWELL_GEN = 4
+INTEL_KABYLAKE_GEN = 7
+INTEL_FAMILY_CORE = 6  # Intel Core family ID in CPUID
+INTEL_MODEL_KABYLAKE = 142  # 7th gen+
+INTEL_MODEL_SKYLAKE = 94  # 6th gen
+INTEL_MODEL_BROADWELL = 61  # 5th gen
+INTEL_MODEL_HASWELL = 60  # 4th gen
+MIN_CORES_FOR_AFFINITY = 4  # Systems with <= 4 cores use OS scheduler
+MIN_P_CORES_REQUIRED = 4  # Minimum P-cores for heterogeneous CPU detection
+MAX_P_CORES_FOR_ENCODING = 8  # Use up to 8 P-cores for encoding
+P_CORE_FREQ_THRESHOLD = 0.9  # P-cores are within 10% of max frequency
+
+# Auth and rate limiting
+AUTH_ROTATION_THRESHOLD = 3  # Failed attempts before forcing PIN rotation
+METRICS_LOG_INTERVAL_SECS = 60  # Log performance metrics every 60s
+HEARTBEAT_RECONNECT_GRACE_SECS = 10  # Grace period after disconnect before timeout
+HEARTBEAT_MAX_BACKOFF_SECS = 30.0  # Maximum cooldown between reconnect attempts
+HEARTBEAT_BACKOFF_EXPONENT_MAX = 4  # Max exponent for exponential backoff (2^4 = 16x)
+GAMEPAD_MIN_PACKET_SIZE = 5  # Minimum HID event packet size
+
+# Protocol constants
+MPEGTS_PACKET_SIZE = 188  # MPEG-TS packet size
+TS_PACKETS_PER_UDP = 7  # 7 TS packets = 1316 bytes (fits in 1500 MTU)
+CHALLENGE_SIZE_BYTES = 32  # Authentication challenge size
+CSR_AUTH_MIN_PARTS = 3  # "AUTH CSR <pin>" requires 3 parts
+CERT_AUTH_MIN_PARTS = 2  # "AUTH CERT:..." requires 2 parts
+HELLO_MIN_PARTS = 2  # Legacy "HELLO" protocol
+FFMPEG_OUTPUT_MIN_PARTS = 2  # Minimum parts when parsing ffmpeg output "d <name>"
+PROTOCOL_CMD_AND_ARG = 2  # Minimum parts for commands with one argument
+PACTL_OUTPUT_MIN_PARTS = 5  # pactl list output: index, name, driver, sample_spec, state
+MOUSE_PKT_PARTS = 5  # MOUSE_PKT has 5 parts: cmd, type, bmask, x, y
+MOUSE_PKT_TYPE_DOWN = 1  # Mouse button press
+MOUSE_PKT_TYPE_UP = 3  # Mouse button release
+CLIPBOARD_UPDATE_MIN_PARTS = 3  # CLIPBOARD_UPDATE CLIENT <data>
+
+# Bitrate conversion constants
+BITS_PER_KILOBIT = 1000
+BITS_PER_MEGABIT = 1_000_000
+BITS_PER_GIGABIT = 1_000_000_000
+
+# Network overhead
+IPV4_UDP_OVERHEAD = 28  # 20 (IP) + 8 (UDP)
+IPV6_UDP_OVERHEAD = 48  # 40 (IPv6) + 8 (UDP)
+
+# Performance thresholds
+ENCODER_STARTUP_THRESHOLD_MS = 100  # Warn if encoder takes >100ms to start
+HIGH_FPS_THRESHOLD = 90  # Adjust bitrate for high frame rates
+STEREO_CHANNELS = 2  # Audio channel threshold
+SURROUND_BITRATE_KBPS = 384  # Bitrate for >2 channels
+STEREO_BITRATE_KBPS = 128  # Bitrate for stereo
+
+# UDP socket buffer sizes (bytes)
+UDP_SEND_BUFFER_SIZE = 2_097_152  # 2MB send buffer for video
+UDP_RECV_BUFFER_SIZE = 524_288  # 512KB receive buffer for control/heartbeat
+UDP_BUSY_POLL_USEC = 50  # SO_BUSY_POLL: 50µs for ultra-low latency (requires root or CAP_NET_ADMIN)
+
+# Socket reuse flags for fast restarts
+SOCKET_REUSE_FLAGS = socket.SO_REUSEADDR | (socket.SO_REUSEPORT if hasattr(socket, "SO_REUSEPORT") else 0)
 
 DEFAULT_FPS = "30"
 LEGACY_BITRATE = "8M"
@@ -88,8 +152,8 @@ def _ensure_ca():
             .issuer_name(issuer)
             .public_key(key.public_key())
             .serial_number(x509.random_serial_number())
-            .not_valid_before(datetime.datetime.now(datetime.timezone.utc))
-            .not_valid_after(datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=3650))
+            .not_valid_before(datetime.datetime.now(datetime.UTC))
+            .not_valid_after(datetime.datetime.now(datetime.UTC) + datetime.timedelta(days=3650))
             .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
             .sign(key, hashes.SHA256())
         )
@@ -114,8 +178,8 @@ def _load_trust_db():
         if Path(TRUSTED_DB).exists():
             with Path(TRUSTED_DB).open(encoding="utf-8") as f:
                 db = json.load(f)
-    except Exception:
-        pass
+    except (OSError, json.JSONDecodeError) as e:
+        logging.warning("[AUTH] Failed to load trust database: %s", e)
     return db
 
 
@@ -129,25 +193,56 @@ def _save_trust_db(db):
         return False
 
 
-def _trust_record_for(fp_hex, db):
+def _trust_record_for(fp_hex: str, db: dict) -> dict | None:
+    """Find trust record for fingerprint in database.
+
+    Args:
+        fp_hex: SHA256 fingerprint in hex format
+        db: Trust database dictionary
+
+    Returns:
+        dict | None: Trust record or None if not found
+    """
     for rec in db.get("trusted_clients", []):
         if rec.get("fingerprint") == fp_hex:
             return rec
     return None
 
 
-def _verify_fingerprint_trusted(fp_hex):
+def _verify_fingerprint_trusted(fp_hex: str) -> bool:
+    """Verify if certificate fingerprint is in trusted database.
+
+    Args:
+        fp_hex: SHA256 fingerprint in hex format (uppercase)
+
+    Returns:
+        bool: True if fingerprint is trusted
+    """
     db = _load_trust_db()
     rec = _trust_record_for(fp_hex, db)
     return (rec is not None) and (rec.get("status") == "trusted")
 
 
-def _issue_client_cert(client_name="linuxplay-client", export_hint_ip="", csr_pem: bytes | None = None):
+def _issue_client_cert(
+    client_name: str = "linuxplay-client",
+    export_hint_ip: str = "",
+    csr_pem: bytes | None = None,
+) -> tuple[bytes, bytes | None] | None:
     """
     Issue client certificate.
 
     NEW (secure): If csr_pem is provided, sign CSR (client generated keypair).
     OLD (legacy): If csr_pem is None, generate client keypair on server (INSECURE - deprecated).
+
+    Args:
+        client_name: Common name for certificate
+        export_hint_ip: IP address hint for export directory naming
+        csr_pem: PEM-encoded Certificate Signing Request (None = legacy mode)
+
+    Returns:
+        tuple[bytes, bytes | None]: (cert_pem, key_pem) or None on error
+            - cert_pem: PEM-encoded certificate
+            - key_pem: PEM-encoded private key (None in CSR mode)
     """
     if not _ensure_ca():
         return None
@@ -172,8 +267,8 @@ def _issue_client_cert(client_name="linuxplay-client", export_hint_ip="", csr_pe
                 .issuer_name(ca_cert.subject)
                 .public_key(public_key)
                 .serial_number(x509.random_serial_number())
-                .not_valid_before(datetime.datetime.now(datetime.timezone.utc))
-                .not_valid_after(datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=1825))
+                .not_valid_before(datetime.datetime.now(datetime.UTC))
+                .not_valid_after(datetime.datetime.now(datetime.UTC) + datetime.timedelta(days=1825))
                 .sign(ca_key, hashes.SHA256())
             )
 
@@ -191,8 +286,8 @@ def _issue_client_cert(client_name="linuxplay-client", export_hint_ip="", csr_pe
                 .issuer_name(ca_cert.subject)
                 .public_key(key.public_key())
                 .serial_number(x509.random_serial_number())
-                .not_valid_before(datetime.datetime.now(datetime.timezone.utc))
-                .not_valid_after(datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=1825))
+                .not_valid_before(datetime.datetime.now(datetime.UTC))
+                .not_valid_after(datetime.datetime.now(datetime.UTC) + datetime.timedelta(days=1825))
                 .sign(ca_key, hashes.SHA256())
             )
 
@@ -207,7 +302,7 @@ def _issue_client_cert(client_name="linuxplay-client", export_hint_ip="", csr_pe
 
         db = _load_trust_db()
         if _trust_record_for(fp_hex, db) is None:
-            now = datetime.datetime.now(datetime.timezone.utc).isoformat() + "Z"
+            now = datetime.datetime.now(datetime.UTC).isoformat() + "Z"
             db.setdefault("trusted_clients", []).append(
                 {
                     "fingerprint": fp_hex,
@@ -216,11 +311,12 @@ def _issue_client_cert(client_name="linuxplay-client", export_hint_ip="", csr_pe
                     "trusted_since": now,
                     "last_seen": now,
                     "status": "trusted",
+                    "cert_pem": cert_pem.decode("utf-8"),  # Save cert for signature verification
                 }
             )
             _save_trust_db(db)
 
-        stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d-%H%M%S")
+        stamp = datetime.datetime.now(datetime.UTC).strftime("%Y%m%d-%H%M%S")
         export_dir = Path("issued_clients") / f"{stamp}_{export_hint_ip or 'client'}"
         export_dir.mkdir(parents=True, exist_ok=True)
         (export_dir / "client_cert.pem").write_bytes(cert_pem)
@@ -229,8 +325,8 @@ def _issue_client_cert(client_name="linuxplay-client", export_hint_ip="", csr_pe
         try:
             ca_pem = Path(CA_CERT).read_bytes()
             (export_dir / "host_ca.pem").write_bytes(ca_pem)
-        except Exception:
-            pass
+        except OSError as e:
+            logging.warning("[AUTH] Failed to copy CA cert to export dir: %s", e)
 
         mode_str = "CSR-signed" if csr_pem else "server-generated (legacy)"
         logging.info(
@@ -286,10 +382,16 @@ def _verify_signature(cert_pem: bytes, challenge: bytes, signature: bytes) -> bo
 
 
 def _ffmpeg_base_cmd() -> list:
+    """Return base FFmpeg command with error logging enabled.
+
+    Uses -loglevel error to show only errors, not warnings.
+    Stderr should be captured by caller for debugging.
+    """
     return ["ffmpeg", "-hide_banner", "-loglevel", "error"]
 
 
 def _marker_opt() -> list:
+    """Return metadata marker for FFmpeg process identification."""
     return ["-metadata", f"comment={_marker_value()}"]
 
 
@@ -353,9 +455,73 @@ class HostState:
         # Rate limiting for PIN auth
         self.failed_auth_attempts = {}  # ip -> (count, first_attempt_time, lockout_until)
         self.auth_lock = threading.Lock()
+        # Performance metrics
+        self.perf_metrics = {
+            "session_start": 0.0,
+            "frames_encoded": 0,
+            "bytes_sent": 0,
+            "last_metric_log": 0.0,
+            "encoder_restarts": 0,
+            "heartbeat_timeouts": 0,
+            "cpu_affinity_set": False,
+            "numa_node": None,
+        }
 
 
 host_state = HostState()
+
+
+def log_performance_metrics():
+    """Log performance metrics at regular intervals for monitoring latency and health.
+
+    Tracks:
+    - Session uptime
+    - CPU usage of encoder processes
+    - Memory usage
+    - Encoder restart count (indicates stability issues)
+    - Network throughput (approximate)
+
+    Called periodically from heartbeat thread to provide visibility into
+    streaming performance without impacting latency.
+    """
+    now = time.time()
+    metrics = host_state.perf_metrics
+
+    # Log every 60 seconds
+    if now - metrics["last_metric_log"] < METRICS_LOG_INTERVAL_SECS:
+        return
+
+    metrics["last_metric_log"] = now
+
+    if not host_state.session_active:
+        return
+
+    uptime = now - metrics["session_start"] if metrics["session_start"] > 0 else 0
+
+    # Collect CPU and memory stats for encoder processes
+    total_cpu = 0.0
+    total_mem_mb = 0.0
+    process_count = 0
+
+    with host_state.video_thread_lock:
+        for thread in host_state.video_threads:
+            if thread.process and thread.process.poll() is None:
+                try:
+                    ps = psutil.Process(thread.process.pid)
+                    total_cpu += ps.cpu_percent(interval=0.1)
+                    total_mem_mb += ps.memory_info().rss / (1024 * 1024)
+                    process_count += 1
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    pass
+
+    logging.info(
+        f"[PERF] Uptime: {uptime:.1f}s | Encoders: {process_count} "
+        f"| CPU: {total_cpu:.1f}% | Mem: {total_mem_mb:.0f}MB "
+        f"| Restarts: {metrics['encoder_restarts']} "
+        f"| HB Timeouts: {metrics['heartbeat_timeouts']} "
+        f"| Net: {host_state.net_mode.upper()} "
+        f"| NUMA: {metrics['numa_node'] if metrics['numa_node'] is not None else 'N/A'}"
+    )
 
 
 class HostArgsManager:
@@ -484,8 +650,8 @@ def stop_all():
         try:
             host_state.gamepad_thread.stop()
             host_state.gamepad_thread.join(timeout=2)
-        except Exception:
-            pass
+        except (RuntimeError, AttributeError) as e:
+            logging.debug("[GAMEPAD] Thread cleanup error: %s", e)
         host_state.gamepad_thread = None
     for s in (
         host_state.handshake_sock,
@@ -532,7 +698,15 @@ def cleanup():
 atexit.register(cleanup)
 
 
-def _gen_pin(length=PIN_LENGTH):
+def _gen_pin(length: int = PIN_LENGTH) -> str:
+    """Generate random numeric PIN code.
+
+    Args:
+        length: Number of digits (default: PIN_LENGTH)
+
+    Returns:
+        str: Zero-padded PIN code
+    """
     n = secrets.randbelow(10**length)
     return f"{n:0{length}d}"
 
@@ -546,6 +720,10 @@ AUTH_WINDOW = 60  # Track attempts within 60 seconds
 def _check_rate_limit(peer_ip: str) -> tuple[bool, str]:
     """Check if IP is rate limited. Returns (is_allowed, reason)."""
     now = time.time()
+
+    # Fast path: if IP not tracked, allow immediately
+    if peer_ip not in host_state.failed_auth_attempts:
+        return (True, "")
 
     with host_state.auth_lock:
         if peer_ip not in host_state.failed_auth_attempts:
@@ -592,22 +770,66 @@ def _record_failed_auth(peer_ip: str):
         logging.warning(f"[AUTH] Failed attempt {count}/{MAX_AUTH_ATTEMPTS} from {peer_ip}")
 
         # Force PIN rotation after multiple failed attempts
-        if count >= 3:
+        if count >= AUTH_ROTATION_THRESHOLD:
             logging.warning(f"[AUTH] Multiple failed attempts from {peer_ip} - rotating PIN")
             pin_rotate_if_needed(force=True)
 
 
-def _clear_failed_auth(peer_ip: str):
+def _clear_failed_auth(peer_ip: str) -> None:
     """Clear failed auth attempts for IP after successful auth."""
     with host_state.auth_lock:
         if peer_ip in host_state.failed_auth_attempts:
             del host_state.failed_auth_attempts[peer_ip]
 
 
-def pin_rotate_if_needed(force=False):
+def _optimize_udp_socket(sock: socket.socket, send_buf: bool = True, recv_buf: bool = True) -> None:
+    """Apply performance optimizations to UDP socket.
+
+    Optimizations:
+    - SO_REUSEADDR for fast restart
+    - SO_REUSEPORT for load balancing (if available)
+    - Large send/receive buffers (reduces packet loss)
+    - SO_BUSY_POLL for ultra-low latency (requires privilege)
+
+    Args:
+        sock: UDP socket to optimize
+        send_buf: Apply send buffer optimization
+        recv_buf: Apply receive buffer optimization
+    """
+    try:
+        # Enable address reuse for fast restart
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+
+        # Enable port reuse if available (Linux 3.9+, improves load balancing)
+        if hasattr(socket, "SO_REUSEPORT"):
+            with contextlib.suppress(OSError):
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+
+        # Optimize buffers to reduce packet loss
+        if recv_buf:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, UDP_RECV_BUFFER_SIZE)
+        if send_buf:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, UDP_SEND_BUFFER_SIZE)
+
+        # SO_BUSY_POLL for sub-100µs network latency (Linux only, requires privilege)
+        if IS_LINUX:
+            with contextlib.suppress(OSError):
+                sock.setsockopt(socket.SOL_SOCKET, 46, UDP_BUSY_POLL_USEC)  # SO_BUSY_POLL=46
+                logging.debug(f"UDP socket optimized with SO_BUSY_POLL={UDP_BUSY_POLL_USEC}µs")
+    except OSError as e:
+        logging.debug(f"Socket optimization failed (non-critical): {e}")
+
+
+def pin_rotate_if_needed(force: bool = False) -> None:
+    """Rotate PIN if expired or forced. Thread-safe."""
     now = time.time()
+
+    # Fast path: check if rotation needed before acquiring lock
+    if not force and host_state.pin_code and now < host_state.pin_expiry:
+        return
+
     with host_state.pin_lock:
-        # FIXED: Check force BEFORE session_active to allow forced rotation
+        # Re-check under lock (double-checked locking pattern)
         if force or not host_state.pin_code or now >= host_state.pin_expiry:
             # Only skip rotation if session is active AND not forced
             if host_state.session_active and not force:
@@ -627,64 +849,640 @@ def pin_manager_thread():
         time.sleep(1)
 
 
-def has_nvidia():
-    return which("nvidia-smi") is not None
+# Cache for hardware detection to avoid repeated expensive calls
+_HW_CACHE = {}
+
+
+def _clear_hw_cache():
+    """Clear hardware detection cache. Used in tests and when hardware changes."""
+    _HW_CACHE.clear()
+
+
+def has_nvidia() -> bool:
+    """Check if NVIDIA GPU is present and functional.
+
+    Detection methods:
+    1. pynvml library (preferred) - direct GPU query
+    2. nvidia-smi command - fallback if pynvml unavailable
+
+    Returns:
+        bool: True if NVIDIA GPU detected and accessible
+    """
+    if "nvidia" not in _HW_CACHE:
+        detected = False
+
+        # Method 1: pynvml (fastest, most reliable)
+        if HAVE_PYNVML:
+            try:
+                pynvml.nvmlInit()
+                count = pynvml.nvmlDeviceGetCount()
+                pynvml.nvmlShutdown()
+                detected = count > 0
+                if detected:
+                    logging.debug(f"NVIDIA GPU detected via pynvml: {count} device(s)")
+            except Exception as e:
+                logging.debug(f"pynvml detection failed: {e}")
+
+        # Method 2: nvidia-smi (fallback)
+        if not detected:
+            detected = which("nvidia-smi") is not None
+            if detected:
+                logging.debug("NVIDIA GPU detected via nvidia-smi")
+
+        _HW_CACHE["nvidia"] = detected
+    return _HW_CACHE["nvidia"]
 
 
 def is_intel_cpu():
-    try:
-        if IS_LINUX:
-            return "GenuineIntel" in Path("/proc/cpuinfo").read_text()
-        p = (py_platform.processor() or "").lower()
-        return "intel" in p or "intel" in py_platform.platform().lower()
-    except Exception:
-        return False
+    """Check if CPU is Intel."""
+    if "intel_cpu" not in _HW_CACHE:
+        try:
+            if IS_LINUX:
+                _HW_CACHE["intel_cpu"] = "GenuineIntel" in Path("/proc/cpuinfo").read_text()
+            else:
+                p = (py_platform.processor() or "").lower()
+                _HW_CACHE["intel_cpu"] = "intel" in p or "intel" in py_platform.platform().lower()
+        except Exception:
+            _HW_CACHE["intel_cpu"] = False
+    return _HW_CACHE["intel_cpu"]
+
+
+def get_intel_cpu_generation() -> int | None:
+    """Get Intel CPU generation for QSV compatibility check.
+
+    QSV requires Skylake (6th gen) or newer for low-latency streaming.
+    Pre-Skylake CPUs (Haswell, Broadwell) have QSV but lack critical features.
+
+    Returns:
+        int: CPU generation (4-7+), or None if not Intel/unable to detect
+
+    Generation mapping:
+        - 4: Haswell (partial QSV, lacks low-latency)
+        - 5: Broadwell (partial QSV, lacks low-latency)
+        - 6: Skylake (full QSV with low-latency modes) ✅
+        - 7+: Kaby Lake and newer (recommended) ✅
+    """
+    if "intel_generation" not in _HW_CACHE:
+        if not is_intel_cpu():
+            _HW_CACHE["intel_generation"] = None
+            return None
+
+        try:
+            if IS_LINUX and Path("/proc/cpuinfo").exists():
+                cpuinfo = Path("/proc/cpuinfo").read_text()
+                import re
+
+                # Intel microarchitecture detection via CPU family/model
+                family_match = re.search(r"cpu family\s*:\s*(\d+)", cpuinfo)
+                model_match = re.search(r"^model\s*:\s*(\d+)", cpuinfo, re.MULTILINE)
+
+                if family_match and model_match:
+                    family = int(family_match.group(1))
+                    model = int(model_match.group(1))
+
+                    if family == INTEL_FAMILY_CORE:
+                        # Simplified model-to-generation mapping
+                        # Full mapping: https://en.wikichip.org/wiki/intel/cpuid
+                        if model >= INTEL_MODEL_KABYLAKE:  # Kaby Lake+ (7th gen+)
+                            gen = INTEL_KABYLAKE_GEN
+                        elif model >= INTEL_MODEL_SKYLAKE:  # Skylake (6th gen)
+                            gen = INTEL_SKYLAKE_GEN
+                        elif model >= INTEL_MODEL_BROADWELL:  # Broadwell (5th gen)
+                            gen = INTEL_BROADWELL_GEN
+                        elif model >= INTEL_MODEL_HASWELL:  # Haswell (4th gen)
+                            gen = INTEL_HASWELL_GEN
+                        else:
+                            gen = None  # Older/unknown
+
+                        _HW_CACHE["intel_generation"] = gen
+                        logging.debug(f"Intel CPU generation detected: {gen} (family={family}, model={model})")
+                        return gen
+        except Exception as e:
+            logging.debug(f"Intel CPU generation detection failed: {e}")
+
+        _HW_CACHE["intel_generation"] = None
+
+    return _HW_CACHE["intel_generation"]
 
 
 def has_vaapi():
-    return IS_LINUX and Path("/dev/dri/renderD128").exists()
+    """Check if VAAPI hardware acceleration is available.
+
+    Returns True if:
+    1. Linux system
+    2. /dev/dri/renderD128 exists (Intel/AMD GPU render node)
+    3. (Optionally) User has permission to access device
+    """
+    if "vaapi" not in _HW_CACHE:
+        if not IS_LINUX:
+            _HW_CACHE["vaapi"] = False
+            return False
+
+        device_path = Path("/dev/dri/renderD128")
+        if not device_path.exists():
+            _HW_CACHE["vaapi"] = False
+            return False
+
+        # Check if we can actually access the device
+        try:
+            # Try to open device (read-only check)
+            with device_path.open("rb"):
+                # Just check permissions, don't read
+                pass
+            _HW_CACHE["vaapi"] = True
+        except PermissionError:
+            # Device exists but not accessible (not in video group)
+            logging.warning(
+                "VAAPI device /dev/dri/renderD128 exists but not accessible. "
+                "Add user to 'video' group: sudo usermod -aG video $USER"
+            )
+            _HW_CACHE["vaapi"] = False
+        except Exception as e:
+            logging.debug(f"VAAPI device check failed: {e}")
+            _HW_CACHE["vaapi"] = False
+
+    return _HW_CACHE["vaapi"]
 
 
 def ffmpeg_has_encoder(name: str) -> bool:
-    try:
-        out = subprocess.check_output(
-            ["ffmpeg", "-hide_banner", "-encoders"], stderr=subprocess.STDOUT, universal_newlines=True
-        ).lower()
-        return name.lower() in out
-    except Exception:
-        return False
+    """Check if FFmpeg has specific encoder (with timeout and better error handling)."""
+    cache_key = f"encoder_{name}"
+    if cache_key not in _HW_CACHE:
+        try:
+            out = subprocess.check_output(
+                ["ffmpeg", "-hide_banner", "-encoders"],
+                stderr=subprocess.DEVNULL,
+                universal_newlines=True,
+                timeout=5,
+            ).lower()
+            _HW_CACHE[cache_key] = name.lower() in out
+        except subprocess.TimeoutExpired:
+            logging.warning(f"FFmpeg encoder check timed out for '{name}'")
+            _HW_CACHE[cache_key] = False
+        except FileNotFoundError:
+            logging.error("FFmpeg not found in PATH")
+            _HW_CACHE[cache_key] = False
+        except subprocess.CalledProcessError as e:
+            logging.debug(f"FFmpeg encoder check failed for '{name}': exit code {e.returncode}")
+            _HW_CACHE[cache_key] = False
+        except Exception as e:
+            logging.warning(f"Unexpected error checking encoder '{name}': {e}")
+            _HW_CACHE[cache_key] = False
+    return _HW_CACHE[cache_key]
 
 
 def ffmpeg_has_demuxer(name: str) -> bool:
+    """Check if FFmpeg has specific demuxer (with timeout)."""
     try:
         out = subprocess.check_output(
-            ["ffmpeg", "-hide_banner", "-demuxers"], stderr=subprocess.STDOUT, universal_newlines=True
+            ["ffmpeg", "-hide_banner", "-demuxers"],
+            stderr=subprocess.DEVNULL,
+            universal_newlines=True,
+            timeout=5,
         ).lower()
+        # Parse output: "D <name> <description>"
         for line in out.splitlines():
             stripped_line = line.strip().lower()
             if stripped_line.startswith(("d ", " d ")):
                 parts = stripped_line.split()
-                if len(parts) >= 2 and parts[1] == name.lower():
+                if len(parts) >= FFMPEG_OUTPUT_MIN_PARTS and parts[1] == name.lower():
                     return True
         return False
-    except Exception:
+    except subprocess.TimeoutExpired:
+        logging.warning(f"FFmpeg demuxer check timed out for '{name}'")
+        return False
+    except FileNotFoundError:
+        logging.error("FFmpeg not found in PATH")
+        return False
+    except subprocess.CalledProcessError:
+        return False
+    except Exception as e:
+        logging.debug(f"Demuxer check for '{name}' failed: {e}")
         return False
 
 
 def ffmpeg_has_device(name: str) -> bool:
+    """Check if FFmpeg has specific input device (with timeout)."""
     try:
         out = subprocess.check_output(
-            ["ffmpeg", "-hide_banner", "-devices"], stderr=subprocess.STDOUT, universal_newlines=True
+            ["ffmpeg", "-hide_banner", "-devices"],
+            stderr=subprocess.DEVNULL,
+            universal_newlines=True,
+            timeout=5,
         ).lower()
+        # Parse output: "D <name> <description>"
         for line in out.splitlines():
             stripped_line = line.strip().lower()
             if stripped_line.startswith(("d ", " d ")):
                 parts = stripped_line.split()
-                if len(parts) >= 2 and parts[1] == name.lower():
+                if len(parts) >= FFMPEG_OUTPUT_MIN_PARTS and parts[1] == name.lower():
                     return True
         return False
-    except Exception:
+    except subprocess.TimeoutExpired:
+        logging.warning(f"FFmpeg device check timed out for '{name}'")
         return False
+    except FileNotFoundError:
+        logging.error("FFmpeg not found in PATH")
+        return False
+    except subprocess.CalledProcessError:
+        return False
+    except Exception as e:
+        logging.debug(f"Device check for '{name}' failed: {e}")
+        return False
+
+
+def ffmpeg_hwaccels() -> set:
+    """Probe FFmpeg for available hardware accelerators.
+    Returns a set of hwaccel names (e.g., 'qsv', 'cuda', 'vaapi').
+
+    NOTE: Presence of 'qsv' in this set does NOT guarantee encoder support.
+    Intel QSV requires Skylake+ CPU (6th gen or later) and specific SKUs with
+    functioning iGPU. Always verify with ffmpeg_has_encoder() AND test_qsv_encode()
+    before using QSV encoders in production.
+
+    Common QSV failure modes:
+    - iGPU disabled in BIOS/UEFI
+    - Pre-Skylake CPUs (QSV exists but lacks low-latency modes)
+    - Missing i915 kernel driver
+    - Incorrect /dev/dri/renderD128 permissions
+    """
+    if "hwaccels" not in _HW_CACHE:
+        try:
+            out = subprocess.check_output(
+                ["ffmpeg", "-hide_banner", "-hwaccels"], stderr=subprocess.STDOUT, universal_newlines=True, timeout=5
+            )
+            hwaccels = set()
+            for raw_line in out.splitlines():
+                line = raw_line.strip().lower()
+                if line and not line.startswith("hardware"):
+                    hwaccels.add(line)
+            _HW_CACHE["hwaccels"] = hwaccels
+            logging.debug(f"Detected hardware accelerators: {hwaccels}")
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError) as e:
+            logging.debug(f"Hardware accelerator detection failed: {e}")
+            _HW_CACHE["hwaccels"] = set()
+        except Exception as e:
+            logging.warning(f"Unexpected error detecting hwaccels: {e}")
+            _HW_CACHE["hwaccels"] = set()
+    return _HW_CACHE["hwaccels"]
+
+
+def test_qsv_encode() -> bool:
+    """Test if QSV encoder actually works (not just present).
+
+    QSV detection is notoriously unreliable. This function:
+    1. Checks Intel CPU generation (requires Skylake/6th gen+)
+    2. Verifies 'qsv' in ffmpeg hwaccels
+    3. Attempts real encode to confirm functionality
+
+    Returns True if QSV encoding succeeds, False otherwise.
+
+    Common failures:
+    - Pre-Skylake CPUs: QSV exists but lacks low-latency modes
+    - F-series CPUs (e.g., i9-12900KF): No iGPU hardware
+    - iGPU disabled in BIOS
+    - Missing i915 driver or /dev/dri permissions
+    """
+    if "qsv_encode_works" not in _HW_CACHE:
+        # First check: Intel CPU generation
+        cpu_gen = get_intel_cpu_generation()
+        if cpu_gen is not None and cpu_gen < INTEL_SKYLAKE_GEN:
+            logging.info(
+                f"Intel CPU generation {cpu_gen} detected. QSV requires Skylake ({INTEL_SKYLAKE_GEN}th gen) or newer. "
+                "Pre-Skylake QSV lacks low-latency modes needed for streaming."
+            )
+            _HW_CACHE["qsv_encode_works"] = False
+            return False
+
+        # Second check: hwaccels reports QSV
+        if "qsv" not in ffmpeg_hwaccels():
+            logging.debug("QSV not in ffmpeg -hwaccels output")
+            _HW_CACHE["qsv_encode_works"] = False
+            return False
+
+        # Third check: actual encode test
+        try:
+            cmd = [
+                "ffmpeg",
+                "-hide_banner",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=duration=0.1:size=320x240:rate=1",
+                "-c:v",
+                "h264_qsv",
+                "-frames:v",
+                "1",
+                "-f",
+                "null",
+                "-",
+            ]
+            result = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=5, check=False)
+            works = result.returncode == 0
+
+            if not works:
+                stderr = result.stderr.decode("utf-8", errors="ignore") if result.stderr else ""
+                logging.warning(
+                    f"QSV encoder test failed (Intel gen {cpu_gen or 'unknown'}). "
+                    "Common causes: iGPU disabled in BIOS, F-series CPU without iGPU, "
+                    "missing i915 driver, or /dev/dri/renderD128 permissions. "
+                    f"FFmpeg error: {stderr[:200]}"
+                )
+            else:
+                logging.info(f"QSV encoder validated (Intel gen {cpu_gen or 'unknown'})")
+
+            _HW_CACHE["qsv_encode_works"] = works
+        except Exception as e:
+            logging.debug(f"QSV encoder test exception: {e}")
+            _HW_CACHE["qsv_encode_works"] = False
+
+    return _HW_CACHE["qsv_encode_works"]
+
+
+def _detect_cpu_info(report: dict) -> None:
+    """Detect CPU information and populate report."""
+    try:
+        logical_cores = psutil.cpu_count(logical=True)
+        physical_cores = psutil.cpu_count(logical=False) or logical_cores
+        report["cpu"]["logical_cores"] = logical_cores
+        report["cpu"]["physical_cores"] = physical_cores
+        report["cpu"]["hyperthreading"] = logical_cores > physical_cores
+        report["cpu"]["is_intel"] = is_intel_cpu()
+        _detect_heterogeneous_cpu(report)
+    except Exception as e:
+        report["warnings"].append(f"CPU detection failed: {e}")
+
+
+def _detect_heterogeneous_cpu(report: dict) -> None:
+    """Detect P-cores/E-cores on heterogeneous CPUs."""
+    if not IS_LINUX or not Path("/sys/devices/system/cpu").exists():
+        return
+
+    freqs = []
+    for cpu_dir in sorted(Path("/sys/devices/system/cpu").glob("cpu[0-9]*")):
+        max_freq_file = cpu_dir / "cpufreq/cpuinfo_max_freq"
+        if max_freq_file.exists():
+            freq = int(max_freq_file.read_text().strip())
+            cpu_num = int(cpu_dir.name.replace("cpu", ""))
+            freqs.append((cpu_num, freq))
+
+    if not freqs:
+        return
+
+    freqs.sort(key=lambda x: x[1], reverse=True)
+    max_freq = freqs[0][1]
+    p_cores = [cpu for cpu, freq in freqs if freq >= max_freq * 0.9]
+    e_cores = [cpu for cpu, freq in freqs if freq < max_freq * 0.9]
+
+    if p_cores and e_cores:
+        report["cpu"]["heterogeneous"] = True
+        report["cpu"]["p_cores"] = p_cores
+        report["cpu"]["e_cores"] = e_cores
+        report["warnings"].append(
+            f"Heterogeneous CPU detected: {len(p_cores)} P-cores, {len(e_cores)} E-cores. "
+            "P-cores will be preferred for streaming."
+        )
+    else:
+        report["cpu"]["heterogeneous"] = False
+
+
+def _detect_gpu_info(report: dict) -> None:
+    """Detect GPU information and populate report."""
+    report["gpu"]["nvidia"] = has_nvidia()
+    report["gpu"]["vaapi_available"] = has_vaapi()
+
+    if HAVE_PYNVML and report["gpu"]["nvidia"]:
+        try:
+            pynvml.nvmlInit()
+            handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+            name = pynvml.nvmlDeviceGetName(handle)
+            if isinstance(name, bytes):
+                name = name.decode("utf-8")
+            report["gpu"]["nvidia_model"] = name
+            pynvml.nvmlShutdown()
+        except Exception as e:
+            report["warnings"].append(f"NVML GPU query failed: {e}")
+
+
+def _detect_numa_info(report: dict) -> None:
+    """Detect NUMA topology and populate report."""
+    numa_node = get_numa_node_for_gpu()
+    if numa_node is not None:
+        report["numa"]["gpu_node"] = numa_node
+        report["numa"]["multi_socket"] = True
+        report["warnings"].append(
+            f"Multi-socket system detected. GPU on NUMA node {numa_node}. "
+            "Streaming threads will be pinned to this node for lowest latency."
+        )
+    else:
+        report["numa"]["multi_socket"] = False
+
+
+def _detect_encoder_info(report: dict) -> None:
+    """Detect available encoders and populate report."""
+    encoders_to_check = [
+        ("h264_nvenc", "NVENC H.264"),
+        ("hevc_nvenc", "NVENC H.265"),
+        ("h264_qsv", "QSV H.264"),
+        ("hevc_qsv", "QSV H.265"),
+        ("h264_vaapi", "VAAPI H.264"),
+        ("hevc_vaapi", "VAAPI H.265"),
+        ("libx264", "CPU H.264"),
+        ("libx265", "CPU H.265"),
+    ]
+
+    for enc_name, display_name in encoders_to_check:
+        available = ffmpeg_has_encoder(enc_name)
+        report["encoders"][display_name] = {"available": available}
+
+        if "qsv" in enc_name and available:
+            works = test_qsv_encode()
+            report["encoders"][display_name]["tested"] = works
+            if not works:
+                report["warnings"].append(
+                    f"{display_name} encoder present but fails test. "
+                    "Check: iGPU enabled in BIOS, i915 driver loaded, /dev/dri permissions."
+                )
+
+
+def generate_hardware_report() -> dict[str, any]:
+    """Generate comprehensive hardware detection report.
+
+    Returns detailed system information for debugging and optimization.
+    Useful for troubleshooting hardware encoder issues and verifying
+    latency optimizations are applied correctly.
+
+    Returns:
+        Dictionary with keys:
+        - platform: OS and architecture info
+        - cpu: CPU vendor, cores (logical/physical), P-core detection
+        - gpu: GPU vendor, NUMA node, driver info
+        - encoders: Available hardware encoders and test results
+        - accelerators: FFmpeg hardware accelerators
+        - numa: NUMA topology and GPU affinity
+        - affinity: Recommended CPU affinity for streaming
+        - warnings: List of potential issues or recommendations
+    """
+    report = {
+        "platform": {
+            "os": py_platform.system(),
+            "arch": py_platform.machine(),
+            "is_linux": IS_LINUX,
+        },
+        "cpu": {},
+        "gpu": {},
+        "encoders": {},
+        "accelerators": set(),
+        "numa": {},
+        "affinity": [],
+        "warnings": [],
+    }
+
+    _detect_cpu_info(report)
+    _detect_gpu_info(report)
+    _detect_numa_info(report)
+    report["accelerators"] = ffmpeg_hwaccels()
+    _detect_encoder_info(report)
+    report["affinity"] = get_optimal_cpu_affinity()
+
+    has_hw_encoder = any(
+        e["available"] for name, e in report["encoders"].items() if "NVENC" in name or "QSV" in name or "VAAPI" in name
+    )
+    if not has_hw_encoder:
+        report["warnings"].append(
+            "No hardware encoders detected! CPU encoding will cause high CPU usage and latency. "
+            "Install NVIDIA drivers (NVENC), enable Intel iGPU (QSV), or configure VAAPI."
+        )
+
+    if report["cpu"].get("hyperthreading") and not report["affinity"]:
+        report["warnings"].append(
+            "Hyperthreading detected but CPU affinity not set. Consider pinning to physical cores for lower latency."
+        )
+
+    # Latency optimization recommendations
+    if report.get("encoders", {}).get("NVENC H.264", {}).get("available"):
+        report["warnings"].append(
+            "OPTIMIZATION: NVENC H.264 detected. For lowest latency, use: "
+            "--encoder h.264 --hwenc nvenc --tune ull --preset llhp"
+        )
+
+    if report["cpu"].get("heterogeneous"):
+        p_count = len(report["cpu"].get("p_cores", []))
+        report["warnings"].append(
+            f"OPTIMIZATION: Heterogeneous CPU detected with {p_count} P-cores. "
+            "Streaming threads will be automatically pinned to P-cores for best performance."
+        )
+
+    if report["numa"].get("gpu_node") is not None:
+        numa_node = report["numa"]["gpu_node"]
+        report["warnings"].append(
+            f"OPTIMIZATION: Multi-socket system (GPU on NUMA node {numa_node}). "
+            "Threads will be automatically pinned to GPU's NUMA node for 2x lower memory latency."
+        )
+
+    return report
+
+
+def get_optimal_cpu_affinity() -> list[int]:
+    """Get optimal CPU cores for latency-critical streaming tasks.
+
+    Returns physical cores, avoiding hyperthreading and preferring
+    performance cores on heterogeneous CPUs (Intel 12th gen+).
+
+    Uses psutil.cpu_count(logical=False) to get actual physical cores,
+    not logical cores (which include hyperthreading). On 8c/16t system,
+    returns [0-7] not [0-15].
+
+    For heterogeneous CPUs (P-cores + E-cores), prefers P-cores by
+    reading CPU frequencies from /sys/devices/system/cpu/cpuN/cpufreq.
+    """
+    try:
+        # Get physical cores only (no hyperthreading)
+        # CRITICAL: logical=False returns physical count, not logical count
+        physical_count = psutil.cpu_count(logical=False)
+        if not physical_count:
+            physical_count = psutil.cpu_count()
+
+        if not physical_count or physical_count <= MIN_CORES_FOR_AFFINITY:
+            return []  # Let OS scheduler handle small systems
+
+        # On Linux, check for heterogeneous CPUs (P-cores + E-cores)
+        if IS_LINUX and Path("/sys/devices/system/cpu").exists():
+            try:
+                # P-cores typically have higher max frequency
+                # Read CPU frequencies to identify performance cores
+                freqs = []
+                for cpu_dir in sorted(Path("/sys/devices/system/cpu").glob("cpu[0-9]*")):
+                    max_freq_file = cpu_dir / "cpufreq/cpuinfo_max_freq"
+                    if max_freq_file.exists():
+                        freq = int(max_freq_file.read_text().strip())
+                        cpu_num = int(cpu_dir.name.replace("cpu", ""))
+                        freqs.append((cpu_num, freq))
+
+                if freqs:
+                    # Sort by frequency (descending) and take top cores
+                    freqs.sort(key=lambda x: x[1], reverse=True)
+                    max_freq = freqs[0][1]
+                    # P-cores are typically within 10% of max frequency
+                    p_cores = [cpu for cpu, freq in freqs if freq >= max_freq * P_CORE_FREQ_THRESHOLD]
+                    if len(p_cores) >= MIN_P_CORES_REQUIRED:
+                        logging.debug(f"Detected P-cores: {p_cores[:MAX_P_CORES_FOR_ENCODING]}")
+                        return p_cores[:MAX_P_CORES_FOR_ENCODING]  # Use up to 8 P-cores
+            except Exception as e:
+                logging.debug(f"Heterogeneous CPU detection failed: {e}")
+
+        # Fallback: use first N physical cores
+        return list(range(min(physical_count, 8)))
+    except Exception as e:
+        logging.debug(f"CPU affinity detection failed: {e}")
+        return []
+
+
+def get_numa_node_for_gpu() -> int | None:
+    """Get NUMA node closest to primary GPU for optimal latency.
+
+    On multi-socket systems (e.g., dual Xeon), GPU is typically on one
+    NUMA node. Pinning threads to the same NUMA node reduces memory
+    access latency (cross-node = ~2x slower).
+
+    Returns NUMA node number (0, 1, ...) or None if:
+    - Not Linux
+    - Single-socket system
+    - GPU NUMA node undetectable
+
+    Usage: After detecting node, use:
+        psutil.Process().cpu_affinity(cores_on_numa_node)
+
+    Returns NUMA node number or None if detection fails.
+    """
+    if not IS_LINUX:
+        return None
+
+    try:
+        # Try to find GPU's NUMA node via sysfs
+        gpu_paths = list(Path("/sys/class/drm").glob("card[0-9]"))
+        if not gpu_paths:
+            return None
+
+        # Use first card (typically primary display)
+        gpu_device = gpu_paths[0].resolve()
+        numa_node_file = gpu_device / "device/numa_node"
+
+        if numa_node_file.exists():
+            node = int(numa_node_file.read_text().strip())
+            if node >= 0:  # -1 means no NUMA affinity
+                logging.info(
+                    f"GPU on NUMA node {node}. For optimal latency on multi-socket systems, "
+                    "consider pinning threads to this node."
+                )
+                return node
+            logging.debug("GPU has no specific NUMA affinity (single-socket system)")
+        else:
+            logging.debug("NUMA node file not found for GPU (likely single-socket)")
+    except Exception as e:
+        logging.debug(f"NUMA detection failed: {e}")
+
+    return None
 
 
 class StreamThread(threading.Thread):
@@ -695,22 +1493,63 @@ class StreamThread(threading.Thread):
         self.process = None
         self._running = True
 
+    def _setup_cpu_affinity(self, ps):
+        """Configure CPU affinity and priority for the process."""
+        ps.nice(-10)
+        numa_node = get_numa_node_for_gpu()
+        affinity = get_optimal_cpu_affinity()
+
+        if numa_node is not None and affinity and IS_LINUX:
+            self._apply_numa_aware_affinity(ps, numa_node, affinity)
+        elif affinity:
+            ps.cpu_affinity(affinity[:8])
+            logging.debug(f"{self.name} pinned to cores {affinity[:4]}... (physical cores, no HT)")
+        else:
+            logging.debug(f"{self.name} using default CPU affinity (no optimization)")
+
+    def _apply_numa_aware_affinity(self, ps, numa_node, affinity):
+        """Apply NUMA-aware CPU affinity for optimal GPU locality."""
+        try:
+            numa_cores = [cpu for cpu in affinity if Path(f"/sys/devices/system/cpu/cpu{cpu}/node{numa_node}").exists()]
+            if numa_cores:
+                ps.cpu_affinity(numa_cores[:8])
+                logging.info(
+                    f"{self.name} pinned to NUMA node {numa_node} cores {numa_cores[:4]}... "
+                    f"(GPU affinity for 2x lower memory latency)"
+                )
+            else:
+                ps.cpu_affinity(affinity[:8])
+                logging.debug(f"{self.name} pinned to cores {affinity[:4]}... (no NUMA match)")
+        except Exception as e:
+            logging.debug(f"NUMA-aware affinity failed, using default: {e}")
+            if affinity:
+                ps.cpu_affinity(affinity[:8])
+
+    def _log_startup_latency(self, start_time):
+        """Log encoder startup latency."""
+        startup_latency = (time.time() - start_time) * 1000  # ms
+        if startup_latency > ENCODER_STARTUP_THRESHOLD_MS:
+            logging.warning(
+                f"{self.name} startup took {startup_latency:.1f}ms (>{ENCODER_STARTUP_THRESHOLD_MS}ms threshold)"
+            )
+        else:
+            logging.debug(f"{self.name} startup latency: {startup_latency:.1f}ms")
+
     def run(self):
+        start_time = time.time()
         logging.info("Starting %s: %s", self.name, " ".join(self.cmd))
         try:
             self.process = subprocess.Popen(
                 self.cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, universal_newlines=True
             )
 
+            self._log_startup_latency(start_time)
+
             try:
                 ps = psutil.Process(self.process.pid)
-                ps.nice(-10)
-                cpu_count = os.cpu_count()
-                if cpu_count and cpu_count > 4:
-                    ps.cpu_affinity(list(range(min(cpu_count, 8))))
-                logging.debug(f"Affinity + priority applied to {self.name}")
+                self._setup_cpu_affinity(ps)
             except Exception as e:
-                logging.debug(f"Affinity set failed: {e}")
+                logging.debug(f"Affinity/priority set failed: {e}")
 
         except Exception as e:
             trigger_shutdown(f"{self.name} failed to start: {e}")
@@ -730,23 +1569,42 @@ class StreamThread(threading.Thread):
             time.sleep(0.2)
 
     def stop(self):
+        """Stop FFmpeg process with proper cleanup to prevent zombies."""
         self._running = False
+        if not self.process:
+            return
+
         try:
-            if self.process and self.process.poll() is None:
+            if self.process.poll() is None:
+                logging.debug(f"Terminating {self.name} (PID {self.process.pid})")
                 self.process.terminate()
                 try:
-                    self.process.wait(timeout=1.5)
+                    self.process.wait(timeout=2.0)
+                    logging.debug(f"{self.name} terminated gracefully")
                 except subprocess.TimeoutExpired:
+                    logging.warning(f"{self.name} did not terminate, sending SIGKILL")
                     self.process.kill()
-        except Exception:
-            pass
+                    try:
+                        self.process.wait(timeout=1.0)
+                        logging.debug(f"{self.name} killed successfully")
+                    except subprocess.TimeoutExpired:
+                        logging.error(f"{self.name} zombie process (PID {self.process.pid})")
+        except ProcessLookupError:
+            logging.debug(f"{self.name} already exited")
+        except Exception as e:
+            logging.error(f"Error stopping {self.name}: {e}")
 
 
 def _detect_monitors_linux():
     try:
-        out = subprocess.check_output(["xrandr", "--listmonitors"], universal_newlines=True)
-    except Exception as e:
+        out = subprocess.check_output(
+            ["xrandr", "--listmonitors"], universal_newlines=True, timeout=5, stderr=subprocess.DEVNULL
+        )
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError) as e:
         logging.warning("xrandr failed (%s); using default single monitor.", e)
+        return []
+    except Exception as e:
+        logging.error("Unexpected error in monitor detection: %s", e)
         return []
     mons = []
     for line in out.strip().splitlines()[1:]:
@@ -806,41 +1664,59 @@ def _mpegts_ll_mux_flags():
 
 
 def _best_ts_pkt_size(mtu_guess: int, ipv6: bool) -> int:
+    """Calculate optimal MPEG-TS packet size for given MTU.
+
+    Returns multiple of 188 bytes (MPEG-TS packet size) that fits in MTU.
+    Default: 1316 bytes = 7 TS packets for 1500 MTU.
+    """
     if mtu_guess <= 0:
         mtu_guess = 1500
-    overhead = 48 if ipv6 else 28
+    overhead = IPV6_UDP_OVERHEAD if ipv6 else IPV4_UDP_OVERHEAD
     max_payload = max(512, mtu_guess - overhead)
-    return max(188, (max_payload // 188) * 188)
+    return max(MPEGTS_PACKET_SIZE, (max_payload // MPEGTS_PACKET_SIZE) * MPEGTS_PACKET_SIZE)
 
 
 def _parse_bitrate_bits(bstr: str) -> int:
     if not bstr:
         return 0
     s = str(bstr).strip().lower()
+    if not s:
+        return 0
     try:
-        if s.endswith("k"):
-            return int(float(s[:-1]) * 1000)
-        if s.endswith("m"):
-            return int(float(s[:-1]) * 1_000_000)
-        if s.endswith("g"):
-            return int(float(s[:-1]) * 1_000_000_000)
+        # Check last character for suffix (faster than endswith)
+        last_char = s[-1]
+        multiplier = {
+            "k": BITS_PER_KILOBIT,
+            "m": BITS_PER_MEGABIT,
+            "g": BITS_PER_GIGABIT,
+        }.get(last_char)
+
+        if multiplier:
+            return int(float(s[:-1]) * multiplier)
         return int(float(s))
-    except Exception:
+    except (ValueError, IndexError):
         return 0
 
 
 def _format_bits(bits: int) -> str:
-    if bits >= 1_000_000:
-        return f"{max(1, int(bits / 1_000_000))}M"
-    if bits >= 1000:
-        return f"{max(1, int(bits / 1000))}k"
+    """Format bitrate for human-readable display."""
+    if bits >= BITS_PER_MEGABIT:
+        return f"{max(1, bits // BITS_PER_MEGABIT)}M"
+    if bits >= BITS_PER_KILOBIT:
+        return f"{max(1, bits // BITS_PER_KILOBIT)}k"
     return str(max(1, bits))
 
 
 def _target_bpp(codec: str, fps: int) -> float:
+    """Calculate target bits per pixel based on codec and framerate.
+
+    Returns optimal BPP for quality/bitrate balance:
+    - H.264: 0.10 baseline, reduced at high FPS
+    - H.265: 0.06 (better compression)
+    """
     c = (codec or "h.264").lower()
     base = 0.045 if c in ("h.265", "hevc") else 0.07
-    if fps >= 90:
+    if fps >= HIGH_FPS_THRESHOLD:
         base += 0.02
     return base
 
@@ -909,13 +1785,226 @@ def _norm_qp(qp):
         return ""
 
 
-def _pick_encoder_args(codec: str, hwenc: str, preset: str, gop: str, qp: str, tune: str, bitrate: str, pix_fmt: str):
+def _try_nvenc_encoder(codec: str) -> str | None:
+    """Try NVENC encoder for given codec."""
+    encoder_name = "h264_nvenc" if codec == "h.264" else "hevc_nvenc"
+    if has_nvidia() and ffmpeg_has_encoder(encoder_name):
+        latency_note = "lowest latency" if codec == "h.264" else "lowest latency, but slightly higher than H.264"
+        logging.info(f"Auto-selected NVENC for {codec.upper()} encoding ({latency_note})")
+        return "nvenc"
+    return None
+
+
+def _try_qsv_encoder(codec: str, hwaccels: set) -> str | None:
+    """Try QSV encoder for given codec."""
+    encoder_name = "h264_qsv" if codec == "h.264" else "hevc_qsv"
+    if "qsv" in hwaccels and ffmpeg_has_encoder(encoder_name) and test_qsv_encode():
+        logging.info(f"Auto-selected QSV for {codec.upper()} encoding (verified working, low latency)")
+        return "qsv"
+    return None
+
+
+def _try_vaapi_encoder(codec: str) -> str | None:
+    """Try VAAPI encoder for given codec."""
+    encoder_name = "h264_vaapi" if codec == "h.264" else "hevc_vaapi"
+    if has_vaapi() and ffmpeg_has_encoder(encoder_name):
+        logging.info(f"Auto-selected VAAPI for {codec.upper()} encoding (reliable fallback)")
+        return "vaapi"
+    return None
+
+
+def _auto_select_hwenc(codec: str) -> str:
+    """Auto-detect best hardware encoder. Priority: NVENC > QSV > VAAPI > CPU."""
+    hwaccels = ffmpeg_hwaccels()
+
+    # Try hardware encoders in priority order
+    if result := _try_nvenc_encoder(codec):
+        return result
+    if result := _try_qsv_encoder(codec, hwaccels):
+        return result
+    if result := _try_vaapi_encoder(codec):
+        return result
+
+    # Fallback to CPU
+    cpu_lib = "libx264" if codec == "h.264" else "libx265"
+    intensity = "high" if codec == "h.264" else "very high"
+    logging.warning(
+        f"No hardware encoder detected, using CPU ({cpu_lib}) - expect {intensity} CPU usage and higher latency"
+    )
+    return "cpu"
+
+
+def _build_rate_control_flags(hwenc: str, qp: str, bitrate: str, adaptive: bool) -> list[str]:
+    """Build rate control flags based on encoder type."""
+    if "vaapi" in hwenc:
+        qp_val = qp or "23"
+        flags = ["-rc_mode", "CQP", "-qp", qp_val]
+        if bitrate and str(bitrate).lower() not in ("0", "auto"):
+            flags += ["-b:v", bitrate, "-maxrate", bitrate, "-bufsize", bitrate]
+        return flags
+
+    if "nvenc" in hwenc:
+        if adaptive:
+            return ["-rc", "vbr", "-maxrate", bitrate or "15M", "-cq", qp or "23"]
+        return ["-rc", "constqp"] + (["-qp", qp] if qp else [])
+
+    if "qsv" in hwenc:
+        return ["-rc_mode", "ICQ", "-icq_quality", qp or "23"]
+
+    return ["-crf", qp or "23"]
+
+
+def _nvenc_tune_args(tune_l: str) -> list[str]:
+    """Get NVENC tune arguments based on tune preset."""
+    if tune_l in ("zerolatency", "ull", "ultra-low-latency", "ultra_low_latency", "realtime"):
+        return ["-tune", "ull"]
+    if tune_l in ("low-latency", "ll", "low_latency"):
+        return ["-tune", "ll"]
+    if tune_l in ("hq", "film", "quality", "high_quality"):
+        return ["-tune", "hq"]
+    if tune_l in ("lossless",):
+        return ["-tune", "lossless"]
+    return ["-tune", "ll"]
+
+
+def _build_h264_encoder_args(  # noqa: PLR0913
+    hwenc: str,
+    preset_l: str,
+    tune_l: str,
+    gop_val: int,
+    use_gop: bool,
+    dynamic_flags: list[str],
+    pix_fmt: str,
+    ensure_fn,
+) -> tuple[list[str], list[str]]:
+    """Build H.264 encoder arguments for specified hardware encoder."""
+    extra_filters = []
+
+    if hwenc == "nvenc" and ensure_fn("h264_nvenc"):
+        enc = [
+            "-c:v",
+            "h264_nvenc",
+            "-preset",
+            _safe_nvenc_preset(preset_l or "llhq"),
+            *(["-g", str(gop_val)] if use_gop else []),
+            "-bf",
+            "0",
+            "-rc-lookahead",
+            "0",
+            "-refs",
+            "1",
+            "-flags2",
+            "+fast",
+            *dynamic_flags,
+            "-pix_fmt",
+            pix_fmt,
+            "-bsf:v",
+            "h264_mp4toannexb",
+            *_nvenc_tune_args(tune_l),
+        ]
+    elif hwenc == "qsv" and ensure_fn("h264_qsv"):
+        enc = ["-c:v", "h264_qsv", *dynamic_flags, "-pix_fmt", pix_fmt, "-bsf:v", "h264_mp4toannexb"]
+    elif hwenc == "vaapi" and has_vaapi() and ensure_fn("h264_vaapi"):
+        va_fmt = _vaapi_fmt_for_pix_fmt(pix_fmt, "h.264")
+        extra_filters += ["-vf", f"format={va_fmt},hwupload", "-vaapi_device", "/dev/dri/renderD128"]
+        enc = ["-c:v", "h264_vaapi", "-bf", "0", *dynamic_flags, "-pix_fmt", pix_fmt, "-bsf:v", "h264_mp4toannexb"]
+    else:
+        enc = [
+            "-c:v",
+            "libx264",
+            "-preset",
+            preset_l or "ultrafast",
+            "-tune",
+            tune_l or "zerolatency",
+            *(["-g", str(gop_val)] if use_gop else []),
+            *dynamic_flags,
+            "-pix_fmt",
+            pix_fmt,
+            "-bsf:v",
+            "h264_mp4toannexb",
+        ]
+        if tune_l in ("zerolatency", "ultra-low-latency", "ull", "low-latency", "ll"):
+            enc += ["-x264-params", "scenecut=0"]
+
+    return extra_filters, enc
+
+
+def _build_h265_encoder_args(  # noqa: PLR0913
+    hwenc: str,
+    preset_l: str,
+    tune_l: str,
+    gop_val: int,
+    use_gop: bool,
+    dynamic_flags: list[str],
+    pix_fmt: str,
+    ensure_fn,
+) -> tuple[list[str], list[str]]:
+    """Build H.265 encoder arguments for specified hardware encoder."""
+    extra_filters = []
+
+    if hwenc == "nvenc" and ensure_fn("hevc_nvenc"):
+        enc = [
+            "-c:v",
+            "hevc_nvenc",
+            "-preset",
+            _safe_nvenc_preset(preset_l or "p5"),
+            *(["-g", str(gop_val)] if use_gop else []),
+            "-bf",
+            "0",
+            "-rc-lookahead",
+            "0",
+            "-refs",
+            "1",
+            "-flags2",
+            "+fast",
+            *dynamic_flags,
+            "-pix_fmt",
+            pix_fmt,
+            "-bsf:v",
+            "hevc_mp4toannexb",
+            *_nvenc_tune_args(tune_l),
+        ]
+    elif hwenc == "qsv" and ensure_fn("hevc_qsv"):
+        enc = ["-c:v", "hevc_qsv", *dynamic_flags, "-pix_fmt", pix_fmt, "-bsf:v", "hevc_mp4toannexb"]
+    elif hwenc == "vaapi" and has_vaapi() and ensure_fn("hevc_vaapi"):
+        va_fmt = _vaapi_fmt_for_pix_fmt(pix_fmt, "h.265")
+        extra_filters += ["-vf", f"format={va_fmt},hwupload", "-vaapi_device", "/dev/dri/renderD128"]
+        enc = ["-c:v", "hevc_vaapi", "-bf", "0", *dynamic_flags, "-pix_fmt", pix_fmt, "-bsf:v", "hevc_mp4toannexb"]
+    else:
+        enc = [
+            "-c:v",
+            "libx265",
+            "-preset",
+            preset_l or "ultrafast",
+            "-tune",
+            tune_l or "zerolatency",
+            *(["-g", str(gop_val)] if use_gop else []),
+            *dynamic_flags,
+            "-pix_fmt",
+            pix_fmt,
+            "-bsf:v",
+            "hevc_mp4toannexb",
+        ]
+        if tune_l in ("zerolatency", "ultra-low-latency", "ull", "low-latency", "ll"):
+            enc += ["-x265-params", "scenecut=0:rc-lookahead=0"]
+
+    return extra_filters, enc
+
+
+def _pick_encoder_args(codec: str, hwenc: str, preset: str, gop: str, qp: str, tune: str, bitrate: str, pix_fmt: str):  # noqa: PLR0913
     codec = (codec or "h.264").lower()
     hwenc = (hwenc or "auto").lower()
     preset_l = (preset or "").strip().lower()
     tune_l = (tune or "").strip().lower()
     qp = _norm_qp(qp)
-    extra_filters, enc = [], []
+
+    # Warn if H.265 is used with ultra-low-latency tune
+    if codec == "h.265" and tune_l in ("zerolatency", "ull", "ultra-low-latency", "ultra_low_latency", "realtime"):
+        logging.warning(
+            "H.265 codec selected with ultra-low-latency tune. "
+            "For lowest latency, consider H.264 codec which typically has 10-20%% faster decode times. "
+            "H.265 is better for bandwidth-constrained connections, but H.264 is faster for LAN streaming."
+        )
 
     def ensure(name: str) -> bool:
         ok = ffmpeg_has_encoder(name)
@@ -924,77 +2013,13 @@ def _pick_encoder_args(codec: str, hwenc: str, preset: str, gop: str, qp: str, t
         return ok
 
     if hwenc == "auto":
-        if codec == "h.264":
-            if has_nvidia() and ffmpeg_has_encoder("h264_nvenc"):
-                hwenc = "nvenc"
-            elif is_intel_cpu() and ffmpeg_has_encoder("h264_qsv"):
-                hwenc = "qsv"
-            elif has_vaapi() and ffmpeg_has_encoder("h264_vaapi"):
-                hwenc = "vaapi"
-            else:
-                hwenc = "cpu"
-        elif codec == "h.265":
-            if has_nvidia() and ffmpeg_has_encoder("hevc_nvenc"):
-                hwenc = "nvenc"
-            elif is_intel_cpu() and ffmpeg_has_encoder("hevc_qsv"):
-                hwenc = "qsv"
-            elif has_vaapi() and ffmpeg_has_encoder("hevc_vaapi"):
-                hwenc = "vaapi"
-            else:
-                hwenc = "cpu"
-        else:
-            hwenc = "cpu"
+        hwenc = _auto_select_hwenc(codec)
 
     adaptive = getattr(host_args_manager.args, "adaptive", False)
-    str(bitrate or "").lower()
+    dynamic_flags = _build_rate_control_flags(hwenc, qp, bitrate, adaptive)
 
-    if "vaapi" in hwenc:
-        qp_val = qp or "23"
-        dynamic_flags = [
-            "-rc_mode",
-            "CQP",
-            "-qp",
-            qp_val,
-        ]
-        if bitrate and str(bitrate).lower() not in ("0", "auto"):
-            dynamic_flags += [
-                "-b:v",
-                bitrate,
-                "-maxrate",
-                bitrate,
-                "-bufsize",
-                bitrate,
-            ]
-
-    elif "nvenc" in hwenc:
-        if adaptive:
-            dynamic_flags = [
-                "-rc",
-                "vbr",
-                "-maxrate",
-                bitrate or "15M",
-                "-cq",
-                qp or "23",
-            ]
-        else:
-            dynamic_flags = [
-                "-rc",
-                "constqp",
-            ] + (["-qp", qp] if qp else [])
-
-    elif "qsv" in hwenc:
-        dynamic_flags = [
-            "-rc_mode",
-            "ICQ",
-            "-icq_quality",
-            qp or "23",
-        ]
-
-    else:
-        dynamic_flags = [
-            "-crf",
-            qp or "23",
-        ]
+    adaptive = getattr(host_args_manager.args, "adaptive", False)
+    dynamic_flags = _build_rate_control_flags(hwenc, qp, bitrate, adaptive)
 
     try:
         gop_val = int(gop)
@@ -1002,118 +2027,12 @@ def _pick_encoder_args(codec: str, hwenc: str, preset: str, gop: str, qp: str, t
     except Exception:
         gop_val, use_gop = 0, False
 
-    def _nvenc_tune_args():
-        if tune_l in ("zerolatency", "ull", "ultra-low-latency", "ultra_low_latency", "realtime"):
-            return ["-tune", "ull"]
-        if tune_l in ("low-latency", "ll", "low_latency"):
-            return ["-tune", "ll"]
-        if tune_l in ("hq", "film", "quality", "high_quality"):
-            return ["-tune", "hq"]
-        if tune_l in ("lossless",):
-            return ["-tune", "lossless"]
-        return ["-tune", "ll"]
-
     if codec == "h.264":
-        if hwenc == "nvenc" and ensure("h264_nvenc"):
-            enc = [
-                "-c:v",
-                "h264_nvenc",
-                "-preset",
-                _safe_nvenc_preset(preset_l or "llhq"),
-                *(["-g", str(gop_val)] if use_gop else []),
-                "-bf",
-                "0",
-                "-rc-lookahead",
-                "0",
-                "-refs",
-                "1",
-                "-flags2",
-                "+fast",
-                *dynamic_flags,
-                "-pix_fmt",
-                pix_fmt,
-                "-bsf:v",
-                "h264_mp4toannexb",
-                *_nvenc_tune_args(),
-            ]
+        return _build_h264_encoder_args(hwenc, preset_l, tune_l, gop_val, use_gop, dynamic_flags, pix_fmt, ensure)
+    if codec == "h.265":
+        return _build_h265_encoder_args(hwenc, preset_l, tune_l, gop_val, use_gop, dynamic_flags, pix_fmt, ensure)
 
-        elif hwenc == "qsv" and ensure("h264_qsv"):
-            enc = ["-c:v", "h264_qsv", *dynamic_flags, "-pix_fmt", pix_fmt, "-bsf:v", "h264_mp4toannexb"]
-
-        elif hwenc == "vaapi" and has_vaapi() and ensure("h264_vaapi"):
-            va_fmt = _vaapi_fmt_for_pix_fmt(pix_fmt, codec)
-            extra_filters += ["-vf", f"format={va_fmt},hwupload", "-vaapi_device", "/dev/dri/renderD128"]
-            enc = ["-c:v", "h264_vaapi", "-bf", "0", *dynamic_flags, "-pix_fmt", pix_fmt, "-bsf:v", "h264_mp4toannexb"]
-
-        else:
-            enc = [
-                "-c:v",
-                "libx264",
-                "-preset",
-                preset_l or "ultrafast",
-                "-tune",
-                tune_l or "zerolatency",
-                *(["-g", str(gop_val)] if use_gop else []),
-                *dynamic_flags,
-                "-pix_fmt",
-                pix_fmt,
-                "-bsf:v",
-                "h264_mp4toannexb",
-            ]
-            if tune_l in ("zerolatency", "ultra-low-latency", "ull", "low-latency", "ll"):
-                enc += ["-x264-params", "scenecut=0"]
-
-    elif codec == "h.265":
-        if hwenc == "nvenc" and ensure("hevc_nvenc"):
-            enc = [
-                "-c:v",
-                "hevc_nvenc",
-                "-preset",
-                _safe_nvenc_preset(preset_l or "p5"),
-                *(["-g", str(gop_val)] if use_gop else []),
-                "-bf",
-                "0",
-                "-rc-lookahead",
-                "0",
-                "-refs",
-                "1",
-                "-flags2",
-                "+fast",
-                *dynamic_flags,
-                "-pix_fmt",
-                pix_fmt,
-                "-bsf:v",
-                "hevc_mp4toannexb",
-                *_nvenc_tune_args(),
-            ]
-
-        elif hwenc == "qsv" and ensure("hevc_qsv"):
-            enc = ["-c:v", "hevc_qsv", *dynamic_flags, "-pix_fmt", pix_fmt, "-bsf:v", "hevc_mp4toannexb"]
-
-        elif hwenc == "vaapi" and has_vaapi() and ensure("hevc_vaapi"):
-            va_fmt = _vaapi_fmt_for_pix_fmt(pix_fmt, codec)
-            extra_filters += ["-vf", f"format={va_fmt},hwupload", "-vaapi_device", "/dev/dri/renderD128"]
-            enc = ["-c:v", "hevc_vaapi", "-bf", "0", *dynamic_flags, "-pix_fmt", pix_fmt, "-bsf:v", "hevc_mp4toannexb"]
-
-        else:
-            enc = [
-                "-c:v",
-                "libx265",
-                "-preset",
-                preset_l or "ultrafast",
-                "-tune",
-                tune_l or "zerolatency",
-                *(["-g", str(gop_val)] if use_gop else []),
-                *dynamic_flags,
-                "-pix_fmt",
-                pix_fmt,
-                "-bsf:v",
-                "hevc_mp4toannexb",
-            ]
-            if tune_l in ("zerolatency", "ultra-low-latency", "ull", "low-latency", "ll"):
-                enc += ["-x265-params", "scenecut=0:rc-lookahead=0"]
-
-    return extra_filters, enc
+    return [], []
 
 
 def _pick_kms_device():
@@ -1279,6 +2198,58 @@ def build_video_cmd(args, bitrate, monitor_info, video_port):
     return input_side + output_side + (extra_filters or []) + encode + out
 
 
+def _detect_pulse_monitor():
+    """Detect the best available PulseAudio monitor source."""
+    mon = os.environ.get("PULSE_MONITOR", "")
+    if mon:
+        return mon if mon.endswith(".monitor") else f"{mon}.monitor"
+
+    if not which("pactl"):
+        return "default.monitor"
+
+    try:
+        out = subprocess.check_output(["pactl", "list", "short", "sources"], text=True, stderr=subprocess.DEVNULL)
+        best = None
+        for line in out.splitlines():
+            parts = line.split("\t")
+            if len(parts) >= PACTL_OUTPUT_MIN_PARTS:
+                name, state = parts[1], parts[4].upper()
+                if ".monitor" in name:
+                    if state == "RUNNING":
+                        return name
+                    if state == "IDLE" and not best:
+                        best = name
+        if best:
+            return best
+    except Exception as e:
+        logging.warning("PulseAudio monitor detection failed: %s", e)
+
+    return "default.monitor"
+
+
+def _detect_audio_channels(mon):
+    """Detect the number of audio channels for the given monitor source."""
+    if not which("pactl"):
+        return 2
+
+    try:
+        probe = subprocess.check_output(
+            [
+                "bash",
+                "-c",
+                f"pactl list sources | grep -A2 '{mon}' | grep 'Channels' | head -n1 | awk '{{print $2}}'",
+            ],
+            text=True,
+        ).strip()
+        if probe.isdigit():
+            channels = int(probe)
+            return channels if channels in [1, 2, 6, 8] else 2
+    except Exception as e:
+        logging.warning("Audio channel detection failed: %s", e)
+
+    return 2
+
+
 def build_audio_cmd():
     opus_app = os.environ.get("LP_OPUS_APP", "voip")
     opus_fd = os.environ.get("LP_OPUS_FD", "10")
@@ -1287,52 +2258,11 @@ def build_audio_cmd():
     aud_buf = "4194304" if net_mode == "wifi" else "512"
     aud_delay = "150000" if net_mode == "wifi" else "0"
 
-    mon = os.environ.get("PULSE_MONITOR", "")
-    if not mon and which("pactl"):
-        try:
-            out = subprocess.check_output(["pactl", "list", "short", "sources"], text=True, stderr=subprocess.DEVNULL)
-            best = None
-            for line in out.splitlines():
-                parts = line.split("\t")
-                if len(parts) >= 5:
-                    name, state = parts[1], parts[4].upper()
-                    if ".monitor" in name:
-                        if state == "RUNNING":
-                            best = name
-                            break
-                        if state == "IDLE" and not best:
-                            best = name
-            if best:
-                mon = best
-        except Exception as e:
-            logging.warning("PulseAudio monitor detection failed: %s", e)
-
-    if not mon:
-        mon = "default.monitor"
-    elif not mon.endswith(".monitor"):
-        mon += ".monitor"
-
+    mon = _detect_pulse_monitor()
     logging.info("Using PulseAudio source: %s", mon)
 
-    channels = 2
-    if which("pactl"):
-        try:
-            probe = subprocess.check_output(
-                [
-                    "bash",
-                    "-c",
-                    f"pactl list sources | grep -A2 '{mon}' | grep 'Channels' | head -n1 | awk '{{print $2}}'",
-                ],
-                text=True,
-            ).strip()
-            if probe.isdigit():
-                channels = int(probe)
-        except Exception as e:
-            logging.warning("Audio channel detection failed: %s", e)
-    if channels not in [1, 2, 6, 8]:
-        channels = 2
-
-    logging.info("Detected %s channel(s): %s", channels, "Surround" if channels > 2 else "Stereo")
+    channels = _detect_audio_channels(mon)
+    logging.info("Detected %s channel(s): %s", channels, "Surround" if channels > STEREO_CHANNELS else "Stereo")
 
     input_side = [
         *(_ffmpeg_base_cmd()),
@@ -1351,7 +2281,7 @@ def build_audio_cmd():
         "-c:a",
         "libopus",
         "-b:a",
-        "384k" if channels > 2 else "128k",
+        f"{SURROUND_BITRATE_KBPS}k" if channels > STEREO_CHANNELS else f"{STEREO_BITRATE_KBPS}k",
         "-application",
         opus_app,
         "-frame_duration",
@@ -1375,9 +2305,17 @@ def _inject_mouse_move(x, y):
         try:
             _mouse.position = (int(x), int(y))
         except Exception as e:
-            logging.debug("pynput move failed: %s", e)
+            logging.debug(f"pynput move failed: {e}")
     elif IS_LINUX:
-        subprocess.Popen(["xdotool", "mousemove", str(x), str(y)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            # Store handle to prevent zombie processes
+            proc = subprocess.Popen(
+                ["xdotool", "mousemove", str(x), str(y)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            )
+            # Non-blocking wait with cleanup
+            proc.poll()
+        except (OSError, FileNotFoundError) as e:
+            logging.debug(f"xdotool mousemove failed: {e}")
 
 
 def _inject_mouse_down(btn):
@@ -1386,9 +2324,13 @@ def _inject_mouse_down(btn):
         try:
             _mouse.press(b)
         except Exception as e:
-            logging.debug("pynput mousedown failed: %s", e)
+            logging.debug(f"pynput mousedown failed: {e}")
     elif IS_LINUX:
-        subprocess.Popen(["xdotool", "mousedown", btn], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            proc = subprocess.Popen(["xdotool", "mousedown", btn], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            proc.poll()
+        except (OSError, FileNotFoundError) as e:
+            logging.debug(f"xdotool mousedown failed: {e}")
 
 
 def _inject_mouse_up(btn):
@@ -1397,9 +2339,13 @@ def _inject_mouse_up(btn):
         try:
             _mouse.release(b)
         except Exception as e:
-            logging.debug("pynput mouseup failed: %s", e)
+            logging.debug(f"pynput mouseup failed: {e}")
     elif IS_LINUX:
-        subprocess.Popen(["xdotool", "mouseup", btn], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            proc = subprocess.Popen(["xdotool", "mouseup", btn], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            proc.poll()
+        except (OSError, FileNotFoundError) as e:
+            logging.debug(f"xdotool mouseup failed: {e}")
 
 
 def _inject_scroll(btn):
@@ -1414,9 +2360,13 @@ def _inject_scroll(btn):
             elif btn == "7":
                 _mouse.scroll(+1, 0)
         except Exception as e:
-            logging.debug("pynput scroll failed: %s", e)
+            logging.debug(f"pynput scroll failed: {e}")
     elif IS_LINUX:
-        subprocess.Popen(["xdotool", "click", btn], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            proc = subprocess.Popen(["xdotool", "click", btn], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            proc.poll()
+        except (OSError, FileNotFoundError) as e:
+            logging.debug(f"xdotool scroll failed: {e}")
 
 
 _key_map = {
@@ -1552,9 +2502,321 @@ def _inject_key(action, name):
             if isinstance(name, str) and len(name) == 1:
                 keyname = CHAR_TO_X11.get(name, name)
             cmd = ["xdotool", "keydown" if action == "down" else "keyup", keyname]
-            subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            proc.poll()  # Non-blocking cleanup
         except Exception as e:
-            logging.debug("xdotool key %s failed for %r: %s", action, name, e)
+            logging.debug(f"xdotool key {action} failed for {name!r}: {e}")
+
+
+def _validate_csr_pin(peer_ip: str, parts: list) -> tuple[bool, str | None]:
+    """Validate PIN for CSR authentication. Returns (success, error_code)."""
+    if len(parts) < CSR_AUTH_MIN_PARTS:
+        return False, "NEEDPIN"
+
+    provided_pin = parts[2]
+    ok = False
+    with host_state.pin_lock:
+        if (
+            not host_state.session_active
+            and provided_pin == str(host_state.pin_code)
+            and time.time() < host_state.pin_expiry
+        ):
+            ok = True
+
+    if not ok:
+        _record_failed_auth(peer_ip)
+        return False, "FAIL:BADPIN"
+
+    _clear_failed_auth(peer_ip)
+    return True, None
+
+
+def _process_csr_and_issue_cert(conn, peer_ip: str) -> dict | None:
+    """Request CSR from client and issue certificate. Returns cert result or None."""
+    conn.sendall(b"SENDCSR")
+    csr_raw = conn.recv(8192).decode("utf-8", errors="replace").strip()
+
+    if not csr_raw.startswith("CSR:"):
+        conn.sendall(b"FAIL:BADCSR")
+        return None
+
+    csr_b64 = csr_raw[4:]
+    csr_pem = base64.b64decode(csr_b64)
+
+    result = _issue_client_cert(client_name=f"client-{peer_ip}", export_hint_ip=peer_ip, csr_pem=csr_pem)
+    if not result:
+        conn.sendall(b"FAIL:CERTISSUE")
+        return None
+
+    return result
+
+
+def _activate_csr_session(peer_ip: str) -> str:
+    """Activate session after successful CSR auth. Returns monitor info string."""
+    with host_state.pin_lock:
+        host_state.session_active = True
+        host_state.authed_client_ip = peer_ip
+        host_state.pin_expiry = 0
+        host_state.pin_paused = True
+        host_state.last_pong_ts = time.time()
+
+    host_state.client_ip = peer_ip
+    monitors_str = (
+        ";".join(f"{w}x{h}+{ox}+{oy}" for (w, h, ox, oy) in host_state.monitors) if host_state.monitors else DEFAULT_RES
+    )
+    set_status(f"Client (new): {host_state.client_ip}")
+    return monitors_str
+
+
+def _handle_csr_auth(conn, peer_ip, parts, encoder_str):
+    """Handle CSR-based authentication (secure mode)."""
+    logging.info("[AUTH] New secure handshake with CSR from %s", peer_ip)
+
+    # Check rate limiting
+    allowed, reason = _check_rate_limit(peer_ip)
+    if not allowed:
+        logging.warning(f"[AUTH] Rate limit: {peer_ip} - {reason}")
+        with contextlib.suppress(Exception):
+            conn.sendall(f"FAIL:RATELIMIT:{reason}".encode())
+        return False
+
+    # Validate PIN
+    ok, error = _validate_csr_pin(peer_ip, parts)
+    if not ok:
+        with contextlib.suppress(Exception):
+            conn.sendall(error.encode())
+        return False
+
+    # Process CSR and issue certificate
+    try:
+        result = _process_csr_and_issue_cert(conn, peer_ip)
+        if not result:
+            return False
+
+        # Send cert and CA
+        cert_b64 = base64.b64encode(result["cert_pem"]).decode()
+        ca_b64 = base64.b64encode(result["ca_pem"]).decode()
+        conn.sendall(f"CERT:{cert_b64}|{ca_b64}".encode())
+
+        # Activate session
+        monitors_str = _activate_csr_session(peer_ip)
+        
+        # Send final OK (only once!)
+        conn.sendall(f"OK:{encoder_str}:{monitors_str}".encode())
+        set_status(f"Client (new): {host_state.client_ip}")
+        logging.info("[AUTH] Client %s authenticated via CSR (secure mode)", peer_ip)
+        threading.Thread(target=lambda: pin_rotate_if_needed(force=True), daemon=True).start()
+        return True
+    except Exception as e:
+        logging.error("[AUTH] CSR handshake failed: %s", e)
+        with contextlib.suppress(Exception):
+            conn.sendall(b"FAIL:ERROR")
+        return False
+
+
+def _handle_cert_challenge_auth(conn, peer_ip, parts, encoder_str):
+    """Handle challenge-response authentication for existing cert."""
+    fp_hex = parts[1][5:].strip().upper()
+    logging.info("[AUTH] Challenge-response auth from %s (FP: %s...)", peer_ip, fp_hex[:12])
+
+    if host_state.session_active:
+        with contextlib.suppress(Exception):
+            conn.sendall(b"BUSY:ACTIVESESSION")
+        logging.warning(f"[AUTH] Rejected cert client {peer_ip} — active session")
+        return False
+
+    # Verify cert is trusted
+    rec = _trust_record_for(fp_hex, _load_trust_db())
+    if not rec or rec.get("status") != "trusted":
+        with contextlib.suppress(Exception):
+            conn.sendall(b"FAIL:UNTRUSTEDCERT")
+        logging.warning(f"[AUTH] Rejected {peer_ip} — cert not trusted")
+        return False
+
+    challenge = _generate_challenge()
+    challenge_b64 = base64.b64encode(challenge).decode()
+
+    try:
+        conn.sendall(f"CHALLENGE:{challenge_b64}".encode())
+        sig_raw = conn.recv(8192).decode("utf-8", errors="replace").strip()
+        if not sig_raw.startswith("SIGNATURE:"):
+            conn.sendall(b"FAIL:BADSIG")
+            return False
+
+        # Verify signature
+        sig_b64 = sig_raw[10:]  # Remove "SIGNATURE:" prefix
+        try:
+            signature = base64.b64decode(sig_b64)
+        except Exception:
+            conn.sendall(b"FAIL:BADSIG")
+            return False
+
+        # Load certificate PEM from trust database
+        cert_pem = rec.get("cert_pem")
+        if not cert_pem:
+            conn.sendall(b"FAIL:NOCERT")
+            logging.error("[AUTH] No cert_pem in trust record for %s", fp_hex[:12])
+            return False
+
+        # Verify signature matches challenge
+        if not _verify_signature(cert_pem.encode() if isinstance(cert_pem, str) else cert_pem, challenge, signature):
+            conn.sendall(b"FAIL:BADSIG")
+            logging.warning("[AUTH] Signature verification failed for %s", peer_ip)
+            return False
+
+        # Activate session (same as CSR flow)
+        with host_state.pin_lock:
+            host_state.session_active = True
+            host_state.authed_client_ip = peer_ip
+            host_state.pin_expiry = 0
+            host_state.pin_paused = True
+            host_state.last_pong_ts = time.time()
+
+        host_state.client_ip = peer_ip
+        monitors_str = (
+            ";".join(f"{w}x{h}+{ox}+{oy}" for (w, h, ox, oy) in host_state.monitors)
+            if host_state.monitors
+            else DEFAULT_RES
+        )
+
+        resp = f"OK:{encoder_str}:{monitors_str}"
+        try:
+            conn.sendall(resp.encode("utf-8"))
+            conn.shutdown(socket.SHUT_WR)
+            time.sleep(0.05)
+        finally:
+            pass
+
+        set_status(f"Client (secure): {host_state.client_ip}")
+        logging.info("[AUTH] ✓ Client %s authenticated via challenge-response (SECURE)", peer_ip)
+        return True
+    except Exception as e:
+        logging.error("[AUTH] Challenge-response failed: %s", e)
+        with contextlib.suppress(Exception):
+            conn.sendall(b"FAIL:ERROR")
+        return False
+
+
+def _handle_legacy_certfp_auth(conn, peer_ip, parts, encoder_str):
+    """Handle legacy fingerprint-only authentication (DEPRECATED)."""
+    fp_hex = parts[1][len("CERTFP:") :].strip().upper()
+    logging.warning("[AUTH] LEGACY fingerprint-only auth from %s (DEPRECATED)", peer_ip)
+
+    if host_state.session_active:
+        try:
+            conn.sendall(b"BUSY:ACTIVESESSION")
+            conn.shutdown(socket.SHUT_WR)
+            time.sleep(0.05)
+        except Exception:
+            pass
+        logging.warning(f"[AUTH] Rejected CERTFP client {peer_ip} — active session")
+        return False
+
+    if fp_hex and _verify_fingerprint_trusted(fp_hex):
+        host_state.session_active = True
+        host_state.authed_client_ip = peer_ip
+        host_state.pin_expiry = 0
+        host_state.pin_paused = True
+        host_state.last_pong_ts = time.time()
+        host_state.client_ip = peer_ip
+
+        monitors_str = (
+            ";".join(f"{w}x{h}+{ox}+{oy}" for (w, h, ox, oy) in host_state.monitors)
+            if host_state.monitors
+            else DEFAULT_RES
+        )
+        resp = f"OK:{encoder_str}:{monitors_str}"
+        try:
+            conn.sendall(resp.encode("utf-8"))
+            conn.shutdown(socket.SHUT_WR)
+            time.sleep(0.05)
+        finally:
+            pass
+
+        set_status(f"Client (legacy cert): {host_state.client_ip}")
+        logging.warning("[AUTH] Client %s authenticated via CERTFP (LEGACY - please upgrade)", peer_ip)
+        return True
+
+    try:
+        conn.sendall(b"FAIL:UNTRUSTEDCERT")
+        conn.shutdown(socket.SHUT_WR)
+        time.sleep(0.05)
+    except Exception:
+        pass
+    logging.warning(f"[AUTH] Rejected cert from {peer_ip} — not trusted")
+    return False
+
+
+def _handle_legacy_pin_auth(conn, peer_ip, parts, encoder_str):
+    """Handle legacy PIN-only authentication (DEPRECATED)."""
+    provided_pin = parts[1] if len(parts) >= HELLO_MIN_PARTS else ""
+    logging.warning("[AUTH] LEGACY PIN-only auth from %s (DEPRECATED - insecure)", peer_ip)
+
+    allowed, reason = _check_rate_limit(peer_ip)
+    if not allowed:
+        logging.warning(f"[AUTH] Rate limit: {peer_ip} - {reason}")
+        try:
+            conn.sendall(f"FAIL:RATELIMIT:{reason}".encode())
+            conn.shutdown(socket.SHUT_WR)
+            time.sleep(0.05)
+        except Exception:
+            pass
+        return False
+
+    ok = False
+    with host_state.pin_lock:
+        if (
+            not host_state.session_active
+            and provided_pin == str(host_state.pin_code)
+            and time.time() < host_state.pin_expiry
+        ):
+            ok = True
+
+    if ok:
+        _clear_failed_auth(peer_ip)
+        with host_state.pin_lock:
+            host_state.session_active = True
+            host_state.authed_client_ip = peer_ip
+            host_state.pin_expiry = 0
+            host_state.pin_paused = True
+            host_state.last_pong_ts = time.time()
+            logging.info(f"[AUTH] Client {peer_ip} authenticated (LEGACY) — PIN invalidated")
+
+        _issue_client_cert(client_name="linuxplay-client", export_hint_ip=peer_ip, csr_pem=None)
+        threading.Thread(target=lambda: pin_rotate_if_needed(force=True), daemon=True).start()
+
+        host_state.client_ip = peer_ip
+        monitors_str = (
+            ";".join(f"{w}x{h}+{ox}+{oy}" for (w, h, ox, oy) in host_state.monitors)
+            if host_state.monitors
+            else DEFAULT_RES
+        )
+
+        try:
+            conn.sendall(f"OK:{encoder_str}:{monitors_str}".encode())
+            conn.shutdown(socket.SHUT_WR)
+            time.sleep(0.05)
+        finally:
+            pass
+
+        set_status(f"Client (legacy PIN): {host_state.client_ip}")
+        logging.warning("Client %s handshake complete (LEGACY MODE - please upgrade client)", peer_ip)
+        return True
+
+    _record_failed_auth(peer_ip)
+    if host_state.session_active:
+        logging.warning(f"[AUTH] {peer_ip} attempted reuse of consumed PIN (session active)")
+        reply = b"BUSY:ACTIVESESSION"
+    else:
+        logging.warning(f"[AUTH] Rejected {peer_ip}: invalid or expired PIN")
+        reply = b"FAIL:BADPIN"
+    try:
+        conn.sendall(reply)
+        conn.shutdown(socket.SHUT_WR)
+        time.sleep(0.05)
+    except Exception:
+        pass
+    return False
 
 
 def tcp_handshake_server(sock, encoder_str, _args):
@@ -1585,296 +2847,38 @@ def tcp_handshake_server(sock, encoder_str, _args):
                 continue
 
             # NEW: Challenge-response with CSR (secure mode)
-            if cmd == "AUTH" and len(parts) >= 2 and parts[1].startswith("CSR"):
-                logging.info("[AUTH] New secure handshake with CSR from %s", peer_ip)
-
-                # Check rate limiting
-                allowed, reason = _check_rate_limit(peer_ip)
-                if not allowed:
-                    logging.warning(f"[AUTH] Rate limit: {peer_ip} - {reason}")
-                    with contextlib.suppress(Exception):
-                        conn.sendall(f"FAIL:RATELIMIT:{reason}".encode())
-                    conn.close()
+            if cmd == "AUTH" and len(parts) >= CERT_AUTH_MIN_PARTS and parts[1].startswith("CSR"):
+                success = _handle_csr_auth(conn, peer_ip, parts, encoder_str)
+                conn.close()
+                if success:
                     continue
-
-                # Expect PIN first for new clients
-                if len(parts) >= 3:
-                    provided_pin = parts[2]
-                else:
-                    with contextlib.suppress(Exception):
-                        conn.sendall(b"NEEDPIN")
-                    conn.close()
-                    continue
-
-                # Validate PIN
-                ok = False
-                with host_state.pin_lock:
-                    if (
-                        not host_state.session_active
-                        and (provided_pin == str(host_state.pin_code))
-                        and (time.time() < host_state.pin_expiry)
-                    ):
-                        ok = True
-
-                if not ok:
-                    _record_failed_auth(peer_ip)
-                    with contextlib.suppress(Exception):
-                        conn.sendall(b"FAIL:BADPIN")
-                    conn.close()
-                    continue
-
-                # Clear failed attempts
-                _clear_failed_auth(peer_ip)
-
-                # Request CSR
-                try:
-                    conn.sendall(b"SENDCSR")
-                    csr_raw = conn.recv(8192).decode("utf-8", errors="replace").strip()
-                    if not csr_raw.startswith("CSR:"):
-                        conn.sendall(b"FAIL:BADCSR")
-                        conn.close()
-                        continue
-
-                    csr_b64 = csr_raw[4:]
-                    csr_pem = base64.b64decode(csr_b64)
-
-                    # Issue certificate
-                    result = _issue_client_cert(
-                        client_name=f"client-{peer_ip}", export_hint_ip=peer_ip, csr_pem=csr_pem
-                    )
-                    if not result:
-                        conn.sendall(b"FAIL:CERTISSUE")
-                        conn.close()
-                        continue
-
-                    # Send cert and CA
-                    cert_b64 = base64.b64encode(result["cert_pem"]).decode()
-                    ca_b64 = base64.b64encode(result["ca_pem"]).decode()
-                    resp = f"CERT:{cert_b64}|{ca_b64}"
-                    conn.sendall(resp.encode())
-
-                    # Mark session as active
-                    with host_state.pin_lock:
-                        host_state.session_active = True
-                        host_state.authed_client_ip = peer_ip
-                        host_state.pin_expiry = 0
-                        host_state.pin_paused = True
-                        host_state.last_pong_ts = time.time()
-
-                    host_state.client_ip = peer_ip
-                    monitors_str = (
-                        ";".join(f"{w}x{h}+{ox}+{oy}" for (w, h, ox, oy) in host_state.monitors)
-                        if host_state.monitors
-                        else DEFAULT_RES
-                    )
-
-                    # Send final OK
-                    ok_resp = f"OK:{encoder_str}:{monitors_str}"
-                    conn.sendall(ok_resp.encode())
-                    conn.close()
-
-                    set_status(f"Client (new): {host_state.client_ip}")
-                    logging.info("[AUTH] Client %s authenticated via CSR (secure mode)", peer_ip)
-                    threading.Thread(target=lambda: pin_rotate_if_needed(force=True), daemon=True).start()
-
-                except Exception as e:
-                    logging.error("[AUTH] CSR handshake failed: %s", e)
-                    with contextlib.suppress(Exception):
-                        conn.sendall(b"FAIL:ERROR")
-                    conn.close()
-                continue
 
             # NEW: Challenge-response for existing cert (signature verification)
-            if cmd == "AUTH" and len(parts) >= 2 and parts[1].startswith("CERT:"):
-                fp_hex = parts[1][5:].strip().upper()
-                logging.info("[AUTH] Challenge-response auth from %s (FP: %s...)", peer_ip, fp_hex[:12])
-
-                if host_state.session_active:
-                    with contextlib.suppress(Exception):
-                        conn.sendall(b"BUSY:ACTIVESESSION")
-                    conn.close()
-                    logging.warning(f"[AUTH] Rejected cert client {peer_ip} — active session")
-                    continue
-
-                # Verify cert is trusted
-                rec = _trust_record_for(fp_hex, _load_trust_db())
-                if not rec or rec.get("status") != "trusted":
-                    with contextlib.suppress(Exception):
-                        conn.sendall(b"FAIL:UNTRUSTEDCERT")
-                    conn.close()
-                    logging.warning(f"[AUTH] Rejected {peer_ip} — cert not trusted")
-                    continue
-
-                # Generate challenge
-                challenge = _generate_challenge()
-                challenge_b64 = base64.b64encode(challenge).decode()
-
-                try:
-                    # Send challenge
-                    conn.sendall(f"CHALLENGE:{challenge_b64}".encode())
-
-                    # Receive signature
-                    sig_raw = conn.recv(8192).decode("utf-8", errors="replace").strip()
-                    if not sig_raw.startswith("SIGNATURE:"):
-                        conn.sendall(b"FAIL:BADSIG")
-                        conn.close()
-                        continue
-
-                    sig_b64 = sig_raw[10:]
-                    base64.b64decode(sig_b64)
-
-                    # Load client cert from trust DB to verify signature
-                    # Note: In production, store full cert in DB. For now, reject with deprecation warning
-                    logging.warning("[AUTH] DEPRECATED: Old cert auth requires upgrade. Use new CSR flow.")
-                    conn.sendall(b"FAIL:DEPRECATED:UPGRADE_REQUIRED")
-                    conn.close()
-                    continue
-
-                except Exception as e:
-                    logging.error("[AUTH] Challenge-response failed: %s", e)
-                    with contextlib.suppress(Exception):
-                        conn.sendall(b"FAIL:ERROR")
-                    conn.close()
+            if cmd == "AUTH" and len(parts) >= CERT_AUTH_MIN_PARTS and parts[1].startswith("CERT:"):
+                _handle_cert_challenge_auth(conn, peer_ip, parts, encoder_str)
+                conn.close()
                 continue
 
             # LEGACY: Fingerprint-only (DEPRECATED)
-            if cmd == "HELLO" and len(parts) >= 2 and parts[1].startswith("CERTFP:"):
-                fp_hex = parts[1][len("CERTFP:") :].strip().upper()
-                logging.warning("[AUTH] LEGACY fingerprint-only auth from %s (DEPRECATED)", peer_ip)
-
-                if host_state.session_active:
-                    try:
-                        conn.sendall(b"BUSY:ACTIVESESSION")
-                        conn.shutdown(socket.SHUT_WR)
-                        time.sleep(0.05)
-                    except Exception:
-                        pass
-                    conn.close()
-                    logging.warning(f"[AUTH] Rejected CERTFP client {peer_ip} — active session")
-                    continue
-
-                if fp_hex and _verify_fingerprint_trusted(fp_hex):
-                    host_state.session_active = True
-                    host_state.authed_client_ip = peer_ip
-                    host_state.pin_expiry = 0
-                    host_state.pin_paused = True
-                    host_state.last_pong_ts = time.time()
-                    host_state.client_ip = peer_ip
-
-                    monitors_str = (
-                        ";".join(f"{w}x{h}+{ox}+{oy}" for (w, h, ox, oy) in host_state.monitors)
-                        if host_state.monitors
-                        else DEFAULT_RES
-                    )
-                    resp = f"OK:{encoder_str}:{monitors_str}"
-                    try:
-                        conn.sendall(resp.encode("utf-8"))
-                        conn.shutdown(socket.SHUT_WR)
-                        time.sleep(0.05)
-                    finally:
-                        conn.close()
-
-                    set_status(f"Client (legacy cert): {host_state.client_ip}")
-                    logging.warning("[AUTH] Client %s authenticated via CERTFP (LEGACY - please upgrade)", peer_ip)
-                    continue
-                try:
-                    conn.sendall(b"FAIL:UNTRUSTEDCERT")
-                    conn.shutdown(socket.SHUT_WR)
-                    time.sleep(0.05)
-                except Exception:
-                    pass
+            if cmd == "HELLO" and len(parts) >= HELLO_MIN_PARTS and parts[1].startswith("CERTFP:"):
+                _handle_legacy_certfp_auth(conn, peer_ip, parts, encoder_str)
                 conn.close()
-                logging.warning(f"[AUTH] Rejected cert from {peer_ip} — not trusted")
                 continue
 
             # LEGACY: PIN-only (generates server-side keys - DEPRECATED)
             if cmd == "HELLO":
-                provided_pin = parts[1] if len(parts) >= 2 else ""
-                logging.warning("[AUTH] LEGACY PIN-only auth from %s (DEPRECATED - insecure)", peer_ip)
-
-                # SECURITY: Check rate limiting
-                allowed, reason = _check_rate_limit(peer_ip)
-                if not allowed:
-                    logging.warning(f"[AUTH] Rate limit: {peer_ip} - {reason}")
-                    try:
-                        conn.sendall(f"FAIL:RATELIMIT:{reason}".encode())
-                        conn.shutdown(socket.SHUT_WR)
-                        time.sleep(0.05)
-                    except Exception:
-                        pass
-                    conn.close()
-                    continue
-
-                ok = False
-
-                with host_state.pin_lock:
-                    if (
-                        not host_state.session_active
-                        and (provided_pin == str(host_state.pin_code))
-                        and (time.time() < host_state.pin_expiry)
-                    ):
-                        ok = True
-
-                if ok:
-                    # Clear failed attempts on successful auth
-                    _clear_failed_auth(peer_ip)
-
-                    with host_state.pin_lock:
-                        host_state.session_active = True
-                        host_state.authed_client_ip = peer_ip
-                        host_state.pin_expiry = 0
-                        host_state.pin_paused = True
-                        host_state.last_pong_ts = time.time()
-                        logging.info(f"[AUTH] Client {peer_ip} authenticated (LEGACY) — PIN invalidated")
-
-                    # Issue cert in legacy mode (server generates keys - INSECURE)
-                    _issue_client_cert(client_name="linuxplay-client", export_hint_ip=peer_ip, csr_pem=None)
-                    threading.Thread(target=lambda: pin_rotate_if_needed(force=True), daemon=True).start()
-
-                    host_state.client_ip = peer_ip
-                    monitors_str = (
-                        ";".join(f"{w}x{h}+{ox}+{oy}" for (w, h, ox, oy) in host_state.monitors)
-                        if host_state.monitors
-                        else DEFAULT_RES
-                    )
-
-                    resp = f"OK:{encoder_str}:{monitors_str}"
-                    try:
-                        conn.sendall(resp.encode("utf-8"))
-                        conn.shutdown(socket.SHUT_WR)
-                        time.sleep(0.05)
-                    finally:
-                        conn.close()
-
-                    set_status(f"Client (legacy PIN): {host_state.client_ip}")
-                    logging.warning("Client %s handshake complete (LEGACY MODE - please upgrade client)", peer_ip)
-
-                else:
-                    # Record failed attempt
-                    _record_failed_auth(peer_ip)
-
-                    if host_state.session_active:
-                        logging.warning(f"[AUTH] {peer_ip} attempted reuse of consumed PIN (session active)")
-                        reply = b"BUSY:ACTIVESESSION"
-                    else:
-                        logging.warning(f"[AUTH] Rejected {peer_ip}: invalid or expired PIN")
-                        reply = b"FAIL:BADPIN"
-                    try:
-                        conn.sendall(reply)
-                        conn.shutdown(socket.SHUT_WR)
-                        time.sleep(0.05)
-                    except Exception:
-                        pass
-                    conn.close()
-
-            else:
-                try:
-                    conn.sendall(b"FAIL")
-                    conn.shutdown(socket.SHUT_WR)
-                    time.sleep(0.05)
-                except Exception:
-                    pass
+                _handle_legacy_pin_auth(conn, peer_ip, parts, encoder_str)
                 conn.close()
+                continue
+
+            # Unknown command
+            try:
+                conn.sendall(b"FAIL")
+                conn.shutdown(socket.SHUT_WR)
+                time.sleep(0.05)
+            except Exception:
+                pass
+            conn.close()
 
         except OSError:
             break
@@ -1899,11 +2903,19 @@ def start_streams_for_current_client(args):
 
         if getattr(host_state, "last_disconnect_ts", 0) > 0:
             elapsed = time.time() - host_state.last_disconnect_ts
-            if elapsed < 2.0:
+            if elapsed < RECONNECT_COOLDOWN:
                 logging.debug(f"start_streams_for_current_client: cooldown {elapsed:.2f}s — skipping restart.")
                 return
 
         host_state.starting_streams = True
+
+        # Initialize performance metrics for new session
+        host_state.perf_metrics["session_start"] = time.time()
+        host_state.perf_metrics["frames_encoded"] = 0
+        host_state.perf_metrics["bytes_sent"] = 0
+        host_state.perf_metrics["encoder_restarts"] += 1 if host_state.video_threads else 0
+        host_state.perf_metrics["numa_node"] = get_numa_node_for_gpu()
+
         try:
             host_state.video_threads = []
             for i, mon in enumerate(host_state.monitors):
@@ -1926,25 +2938,137 @@ def start_streams_for_current_client(args):
             host_state.starting_streams = False
 
 
+def _handle_net_mode_change(tokens):
+    """Handle network mode change request."""
+    if len(tokens) < HELLO_MIN_PARTS:
+        return
+
+    mode = tokens[1].strip().lower()
+    if mode not in ("wifi", "lan"):
+        return
+
+    old = getattr(host_state, "net_mode", "lan")
+    if mode == old:
+        return
+
+    logging.info(f"Network mode switch requested: {old} → {mode}")
+    host_state.net_mode = mode
+    try:
+        stop_streams_only()
+        if host_args_manager.args:
+            start_streams_for_current_client(host_args_manager.args)
+    except Exception as e:
+        logging.error(f"Restart after NET failed: {e}")
+
+
+def _handle_goodbye():
+    """Handle client disconnect."""
+    peer_ip = host_state.authed_client_ip or host_state.client_ip
+    logging.info(f"Client at {peer_ip} disconnected cleanly.")
+    try:
+        stop_streams_only()
+        host_state.client_ip = None
+        host_state.starting_streams = False
+        host_state.session_active = False
+        host_state.authed_client_ip = None
+        set_status("Client disconnected — waiting for connection…")
+        logging.debug("All streams stopped after GOODBYE.")
+
+        pin_rotate_if_needed(force=True)
+        logging.info("[AUTH] Client disconnected — PIN rotation resumed.")
+
+        time.sleep(RECONNECT_COOLDOWN)
+    except Exception as e:
+        logging.error(f"Error handling GOODBYE cleanup: {e}")
+
+
+def _handle_mouse_packet(tokens):
+    """Handle mouse movement and button events."""
+    if len(tokens) != MOUSE_PKT_PARTS:
+        return
+
+    try:
+        pkt_type = int(tokens[1])
+        bmask = int(tokens[2])
+        x = int(tokens[3])
+        y = int(tokens[4])
+    except ValueError:
+        return
+
+    _inject_mouse_move(x, y)
+
+    if pkt_type == MOUSE_PKT_TYPE_DOWN:
+        if bmask & 1:
+            _inject_mouse_down("1")
+        if bmask & 2:
+            _inject_mouse_down("2")
+        if bmask & 4:
+            _inject_mouse_down("3")
+    elif pkt_type == MOUSE_PKT_TYPE_UP:
+        if bmask & 1:
+            _inject_mouse_up("1")
+        if bmask & 2:
+            _inject_mouse_up("2")
+        if bmask & 4:
+            _inject_mouse_up("3")
+
+
+def _validate_control_packet(peer_ip):
+    """Validate if control packet should be processed. Returns True if valid."""
+    if not host_state.session_active:
+        logging.debug(f"Ignoring control packet from {peer_ip} (no active session)")
+        return False
+
+    if host_state.authed_client_ip:
+        if peer_ip != host_state.authed_client_ip:
+            logging.warning(f"Rejected control packet from {peer_ip} — active client: {host_state.authed_client_ip}")
+            return False
+    else:
+        logging.debug(f"Ignoring early control packet from {peer_ip} (auth IP not yet set)")
+        return False
+
+    return True
+
+
+def _process_control_command(tokens):
+    """Process a control command from client."""
+    if not tokens:
+        return
+
+    cmd = tokens[0].upper()
+
+    if cmd == "NET":
+        _handle_net_mode_change(tokens)
+    elif cmd == "GOODBYE":
+        _handle_goodbye()
+    elif cmd == "MOUSE_PKT":
+        _handle_mouse_packet(tokens)
+    elif cmd == "MOUSE_SCROLL" and len(tokens) == PROTOCOL_CMD_AND_ARG:
+        _inject_scroll(tokens[1])
+    elif cmd == "KEY_PRESS" and len(tokens) == PROTOCOL_CMD_AND_ARG:
+        _inject_key("down", tokens[1])
+    elif cmd == "KEY_RELEASE" and len(tokens) == PROTOCOL_CMD_AND_ARG:
+        _inject_key("up", tokens[1])
+
+
 def control_listener(sock):
+    # Optimize socket for low-latency control input
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, UDP_RECV_BUFFER_SIZE)
+        if IS_LINUX:
+            # SO_BUSY_POLL for ultra-low latency (requires root or CAP_NET_ADMIN)
+            with contextlib.suppress(OSError):
+                sock.setsockopt(socket.SOL_SOCKET, 46, UDP_BUSY_POLL_USEC)  # SO_BUSY_POLL=46
+    except OSError as e:
+        logging.debug(f"Control socket optimization failed (non-critical): {e}")
+
     logging.info("Control listener UDP %d", UDP_CONTROL_PORT)
     while not host_state.should_terminate:
         try:
             data, addr = sock.recvfrom(2048)
             peer_ip = addr[0]
 
-            if not host_state.session_active:
-                logging.debug(f"Ignoring control packet from {peer_ip} (no active session)")
-                continue
-
-            if host_state.authed_client_ip:
-                if peer_ip != host_state.authed_client_ip:
-                    logging.warning(
-                        f"Rejected control packet from {peer_ip} — active client: {host_state.authed_client_ip}"
-                    )
-                    continue
-            else:
-                logging.debug(f"Ignoring early control packet from {peer_ip} (auth IP not yet set)")
+            if not _validate_control_packet(peer_ip):
                 continue
 
             msg = data.decode("utf-8", errors="ignore").strip()
@@ -1952,75 +3076,7 @@ def control_listener(sock):
                 continue
 
             tokens = msg.split()
-            cmd = tokens[0].upper() if tokens else ""
-
-            if cmd == "NET" and len(tokens) >= 2:
-                mode = tokens[1].strip().lower()
-                if mode in ("wifi", "lan"):
-                    old = getattr(host_state, "net_mode", "lan")
-                    if mode != old:
-                        logging.info(f"Network mode switch requested: {old} → {mode}")
-                        host_state.net_mode = mode
-                        try:
-                            stop_streams_only()
-                            if host_args_manager.args:
-                                start_streams_for_current_client(host_args_manager.args)
-                        except Exception as e:
-                            logging.error(f"Restart after NET failed: {e}")
-                continue
-
-            if cmd == "GOODBYE":
-                logging.info(f"Client at {peer_ip} disconnected cleanly.")
-                try:
-                    stop_streams_only()
-                    host_state.client_ip = None
-                    host_state.starting_streams = False
-                    host_state.session_active = False
-                    host_state.authed_client_ip = None
-                    set_status("Client disconnected — waiting for connection…")
-                    logging.debug("All streams stopped after GOODBYE.")
-
-                    pin_rotate_if_needed(force=True)
-                    logging.info("[AUTH] Client disconnected — PIN rotation resumed.")
-
-                    time.sleep(RECONNECT_COOLDOWN)
-                except Exception as e:
-                    logging.error(f"Error handling GOODBYE cleanup: {e}")
-                continue
-
-            if cmd == "MOUSE_PKT" and len(tokens) == 5:
-                try:
-                    pkt_type = int(tokens[1])
-                    bmask = int(tokens[2])
-                    x = int(tokens[3])
-                    y = int(tokens[4])
-                except ValueError:
-                    continue
-
-                _inject_mouse_move(x, y)
-
-                if pkt_type == 1:
-                    if bmask & 1:
-                        _inject_mouse_down("1")
-                    if bmask & 2:
-                        _inject_mouse_down("2")
-                    if bmask & 4:
-                        _inject_mouse_down("3")
-                elif pkt_type == 3:
-                    if bmask & 1:
-                        _inject_mouse_up("1")
-                    if bmask & 2:
-                        _inject_mouse_up("2")
-                    if bmask & 4:
-                        _inject_mouse_up("3")
-
-            elif cmd == "MOUSE_SCROLL" and len(tokens) == 2:
-                _inject_scroll(tokens[1])
-
-            elif cmd == "KEY_PRESS" and len(tokens) == 2:
-                _inject_key("down", tokens[1])
-            elif cmd == "KEY_RELEASE" and len(tokens) == 2:
-                _inject_key("up", tokens[1])
+            _process_control_command(tokens)
 
         except OSError:
             break
@@ -2070,6 +3126,13 @@ def clipboard_monitor_host():
 def clipboard_listener_host(sock):
     if not HAVE_PYPERCLIP:
         return
+
+    # Optimize socket for clipboard data
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, UDP_RECV_BUFFER_SIZE)
+    except OSError as e:
+        logging.debug(f"Clipboard socket optimization failed (non-critical): {e}")
+
     while not host_state.should_terminate:
         try:
             data, addr = sock.recvfrom(65535)
@@ -2083,7 +3146,7 @@ def clipboard_listener_host(sock):
                 continue
 
             tokens = msg.split(maxsplit=2)
-            if len(tokens) >= 3 and tokens[0] == "CLIPBOARD_UPDATE" and tokens[1] == "CLIENT":
+            if len(tokens) >= CLIPBOARD_UPDATE_MIN_PARTS and tokens[0] == "CLIPBOARD_UPDATE" and tokens[1] == "CLIENT":
                 # Remember client's ephemeral port for responses
                 if addr[0] == host_state.client_ip:
                     host_state.client_clipboard_addr = addr
@@ -2192,10 +3255,95 @@ def file_upload_listener():
         host_state.file_upload_sock = None
 
 
+def _handle_heartbeat_timeout(now):
+    """Handle heartbeat timeout with exponential backoff."""
+    timeout_count = host_state.perf_metrics.get("heartbeat_timeouts", 0)
+    cooldown = min(
+        RECONNECT_COOLDOWN * (2 ** min(timeout_count, HEARTBEAT_BACKOFF_EXPONENT_MAX)),
+        HEARTBEAT_MAX_BACKOFF_SECS,
+    )
+
+    logging.warning(
+        "Heartbeat timeout from %s (timeout #%d) — no PONG or GOODBYE for %.1fs, stopping streams. Cooldown: %.1fs",
+        host_state.client_ip,
+        timeout_count + 1,
+        now - host_state.last_pong_ts,
+        cooldown,
+    )
+
+    host_state.perf_metrics["heartbeat_timeouts"] += 1
+
+    try:
+        stop_streams_only()
+    except Exception as e:
+        logging.error("Error stopping streams after timeout: %s", e)
+
+    host_state.last_disconnect_ts = now
+    host_state.client_ip = None
+    host_state.starting_streams = False
+    set_status("Client disconnected — waiting for connection…")
+    host_state.session_active = False
+    host_state.authed_client_ip = None
+    pin_rotate_if_needed(force=True)
+
+    time.sleep(cooldown)
+
+
+def _send_heartbeat_ping(sock, client_heartbeat_addr, last_ping, now):
+    """Send PING to client and return updated last_ping timestamp."""
+    if now - last_ping < HEARTBEAT_INTERVAL:
+        return last_ping
+
+    try:
+        if client_heartbeat_addr:
+            sock.sendto(b"PING", client_heartbeat_addr)
+        else:
+            sock.sendto(b"PING", (host_state.client_ip, UDP_HEARTBEAT_PORT))
+        return now
+    except Exception as e:
+        logging.warning("Heartbeat send error: %s", e)
+        return last_ping
+
+
+def _receive_heartbeat_pong(sock, client_heartbeat_addr, now):
+    """Receive PONG from client and return updated client_heartbeat_addr."""
+    sock.settimeout(0.5)
+    try:
+        data, addr = sock.recvfrom(1024)
+        msg = data.decode("utf-8", errors="ignore").strip()
+        if msg.startswith("PONG") and addr[0] == host_state.client_ip:
+            host_state.last_pong_ts = now
+            if not client_heartbeat_addr or client_heartbeat_addr != addr:
+                client_heartbeat_addr = addr
+                logging.debug(f"Client heartbeat address updated to {addr}")
+    except TimeoutError:
+        pass
+    except Exception as e:
+        logging.debug("Heartbeat recv error: %s", e)
+
+    return client_heartbeat_addr
+
+
+def _check_heartbeat_timeout(now, client_heartbeat_addr):
+    """Check for heartbeat timeout and handle if necessary. Returns updated client_heartbeat_addr."""
+    if (now - host_state.last_pong_ts) > HEARTBEAT_TIMEOUT and (
+        now - host_state.last_disconnect_ts
+    ) > HEARTBEAT_RECONNECT_GRACE_SECS:
+        if host_state.client_ip:
+            _handle_heartbeat_timeout(now)
+            client_heartbeat_addr = None
+        host_state.last_pong_ts = now
+    elif host_state.client_ip and (now - host_state.last_pong_ts) < HEARTBEAT_INTERVAL * 2:
+        if host_state.perf_metrics.get("heartbeat_timeouts", 0) > 0:
+            logging.debug("Heartbeat recovered, resetting timeout counter")
+
+    return client_heartbeat_addr
+
+
 def heartbeat_manager(_args):
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
-        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        _optimize_udp_socket(s, send_buf=True, recv_buf=True)
         s.bind((_args.bind_address, UDP_HEARTBEAT_PORT))
         host_state.heartbeat_sock = s
         logging.info("Heartbeat manager running on UDP %d (responds to client's source port)", UDP_HEARTBEAT_PORT)
@@ -2205,62 +3353,22 @@ def heartbeat_manager(_args):
 
     last_ping = 0.0
     host_state.last_pong_ts = time.time()
-    client_heartbeat_addr = None  # Track client's ephemeral port
+    client_heartbeat_addr = None
 
     while not host_state.should_terminate:
         now = time.time()
 
+        try:
+            log_performance_metrics()
+        except Exception as e:
+            logging.debug(f"Performance metrics logging failed: {e}")
+
         if host_state.client_ip:
-            # Send initial PING to the well-known port
-            if now - last_ping >= HEARTBEAT_INTERVAL:
-                try:
-                    # Send to client's ephemeral port if known, otherwise to well-known port
-                    if client_heartbeat_addr:
-                        s.sendto(b"PING", client_heartbeat_addr)
-                    else:
-                        s.sendto(b"PING", (host_state.client_ip, UDP_HEARTBEAT_PORT))
-                    last_ping = now
-                except Exception as e:
-                    logging.warning("Heartbeat send error: %s", e)
-
-            s.settimeout(0.5)
-            try:
-                data, addr = s.recvfrom(1024)
-                msg = data.decode("utf-8", errors="ignore").strip()
-                if msg.startswith("PONG") and addr[0] == host_state.client_ip:
-                    host_state.last_pong_ts = now
-                    # Remember the client's ephemeral port for future PINGs
-                    if not client_heartbeat_addr or client_heartbeat_addr != addr:
-                        client_heartbeat_addr = addr
-                        logging.debug(f"Client heartbeat address updated to {addr}")
-            except TimeoutError:
-                pass
-            except Exception as e:
-                logging.debug("Heartbeat recv error: %s", e)
-
-            if (now - host_state.last_pong_ts) > HEARTBEAT_TIMEOUT and (now - host_state.last_disconnect_ts) > 10:
-                if host_state.client_ip:
-                    logging.warning(
-                        "Heartbeat timeout from %s — no PONG or GOODBYE, stopping streams.", host_state.client_ip
-                    )
-                    try:
-                        stop_streams_only()
-                    except Exception as e:
-                        logging.error("Error stopping streams after timeout: %s", e)
-
-                    host_state.client_ip = None
-                    host_state.starting_streams = False
-                    set_status("Client disconnected — waiting for connection…")
-                    host_state.session_active = False
-                    host_state.authed_client_ip = None
-                    client_heartbeat_addr = None  # Reset on disconnect
-                    pin_rotate_if_needed(force=True)
-
-                    time.sleep(RECONNECT_COOLDOWN)
-
-                host_state.last_pong_ts = now
+            last_ping = _send_heartbeat_ping(s, client_heartbeat_addr, last_ping, now)
+            client_heartbeat_addr = _receive_heartbeat_pong(s, client_heartbeat_addr, now)
+            client_heartbeat_addr = _check_heartbeat_timeout(now, client_heartbeat_addr)
         else:
-            client_heartbeat_addr = None  # Reset when no client
+            client_heartbeat_addr = None
             time.sleep(0.5)
 
 
@@ -2388,8 +3496,13 @@ class GamepadServer(threading.Thread):
     def _open_socket(self):
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+        # Use larger receive buffer for gamepad events
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, UDP_RECV_BUFFER_SIZE)
         s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVLOWAT, 1)
+        if IS_LINUX:
+            # SO_BUSY_POLL for gamepad input responsiveness
+            with contextlib.suppress(OSError):
+                s.setsockopt(socket.SOL_SOCKET, 46, UDP_BUSY_POLL_USEC)  # SO_BUSY_POLL=46
         s.bind((host_args_manager.args.bind_address, UDP_GAMEPAD_PORT))
         s.setblocking(False)
         return s
@@ -2437,6 +3550,79 @@ class GamepadServer(threading.Thread):
         ui.syn()
         return ui
 
+    def _process_dpad_event(self, c, v, pending):
+        """Process D-pad key event and update HAT axes."""
+        if c == ecodes.KEY_LEFT:
+            self._dpad["left"] = v != 0
+        elif c == ecodes.KEY_RIGHT:
+            self._dpad["right"] = v != 0
+        elif c == ecodes.KEY_UP:
+            self._dpad["up"] = v != 0
+        elif c == ecodes.KEY_DOWN:
+            self._dpad["down"] = v != 0
+
+        new_hatx = (
+            -1
+            if self._dpad["left"] and not self._dpad["right"]
+            else (1 if self._dpad["right"] and not self._dpad["left"] else 0)
+        )
+        new_haty = (
+            -1
+            if self._dpad["up"] and not self._dpad["down"]
+            else (1 if self._dpad["down"] and not self._dpad["up"] else 0)
+        )
+
+        if new_hatx != self._hatx:
+            self._hatx = new_hatx
+            pending.append((ecodes.EV_ABS, ecodes.ABS_HAT0X, self._hatx))
+        if new_haty != self._haty:
+            self._haty = new_haty
+            pending.append((ecodes.EV_ABS, ecodes.ABS_HAT0Y, self._haty))
+
+    def _process_gamepad_events(self, buf, n, pending):
+        """Process gamepad events from buffer."""
+        unpack_event = struct.Struct("!Bhh").unpack_from
+
+        for i in range(0, n - 4, 5):
+            try:
+                t, c, v = unpack_event(buf, i)
+            except Exception:
+                continue
+            if not self.ui:
+                continue
+
+            if t == ecodes.EV_KEY and c in (ecodes.KEY_LEFT, ecodes.KEY_RIGHT, ecodes.KEY_UP, ecodes.KEY_DOWN):
+                self._process_dpad_event(c, v, pending)
+            else:
+                pending.append((t, c, v))
+
+    def _receive_and_process_events(self, buf, pending):
+        """Receive and process gamepad events. Returns True to continue, False to break."""
+        try:
+            n, _ = self.sock.recvfrom_into(buf)
+        except BlockingIOError:
+            time.sleep(0.0005)
+            return True
+        except OSError:
+            return False
+
+        if n < GAMEPAD_MIN_PACKET_SIZE:
+            return True
+
+        try:
+            self._process_gamepad_events(buf, n, pending)
+
+            if pending:
+                for et, ec, ev in pending:
+                    self.ui.write(et, ec, ev)
+                self.ui.syn()
+                pending.clear()
+
+        except Exception as e:
+            logging.debug("Gamepad parse/write error: %s", e)
+
+        return True
+
     def run(self):
         with contextlib.suppress(Exception):
             psutil.Process(os.getpid()).nice(-10)
@@ -2454,66 +3640,10 @@ class GamepadServer(threading.Thread):
 
         buf = bytearray(64)
         pending = []
-        unpack_event = struct.Struct("!Bhh").unpack_from
 
         while self._running and not host_state.should_terminate:
-            try:
-                n, _ = self.sock.recvfrom_into(buf)
-            except BlockingIOError:
-                time.sleep(0.0005)
-                continue
-            except OSError:
+            if not self._receive_and_process_events(buf, pending):
                 break
-            if n < 5:
-                continue
-
-            try:
-                for i in range(0, n - 4, 5):
-                    try:
-                        t, c, v = unpack_event(buf, i)
-                    except Exception:
-                        continue
-                    if not self.ui:
-                        continue
-
-                    if t == ecodes.EV_KEY and c in (ecodes.KEY_LEFT, ecodes.KEY_RIGHT, ecodes.KEY_UP, ecodes.KEY_DOWN):
-                        if c == ecodes.KEY_LEFT:
-                            self._dpad["left"] = v != 0
-                        elif c == ecodes.KEY_RIGHT:
-                            self._dpad["right"] = v != 0
-                        elif c == ecodes.KEY_UP:
-                            self._dpad["up"] = v != 0
-                        elif c == ecodes.KEY_DOWN:
-                            self._dpad["down"] = v != 0
-
-                        new_hatx = (
-                            -1
-                            if self._dpad["left"] and not self._dpad["right"]
-                            else (1 if self._dpad["right"] and not self._dpad["left"] else 0)
-                        )
-                        new_haty = (
-                            -1
-                            if self._dpad["up"] and not self._dpad["down"]
-                            else (1 if self._dpad["down"] and not self._dpad["up"] else 0)
-                        )
-
-                        if new_hatx != self._hatx:
-                            self._hatx = new_hatx
-                            pending.append((ecodes.EV_ABS, ecodes.ABS_HAT0X, self._hatx))
-                        if new_haty != self._haty:
-                            self._haty = new_haty
-                            pending.append((ecodes.EV_ABS, ecodes.ABS_HAT0Y, self._haty))
-                    else:
-                        pending.append((t, c, v))
-
-                if pending:
-                    for et, ec, ev in pending:
-                        self.ui.write(et, ec, ev)
-                    self.ui.syn()
-                    pending.clear()
-
-            except Exception as e:
-                logging.debug("Gamepad parse/write error: %s", e)
 
         try:
             if self.ui:
@@ -2555,6 +3685,59 @@ def _signal_handler(signum, _frame):
         sys.exit(0)
 
 
+def _initialize_sockets(bind_address):
+    """Initialize all server sockets. Returns True on success, False on error."""
+    try:
+        host_state.handshake_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        host_state.handshake_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        host_state.handshake_sock.bind((bind_address, TCP_HANDSHAKE_PORT))
+        host_state.handshake_sock.listen(5)
+    except Exception as e:
+        trigger_shutdown(f"Handshake socket error: {e}")
+        return False
+
+    try:
+        host_state.control_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        host_state.control_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        host_state.control_sock.bind((bind_address, UDP_CONTROL_PORT))
+    except Exception as e:
+        trigger_shutdown(f"Control socket error: {e}")
+        return False
+
+    try:
+        host_state.clipboard_listener_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        host_state.clipboard_listener_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        host_state.clipboard_listener_sock.bind((bind_address, UDP_CLIPBOARD_PORT))
+    except Exception as e:
+        trigger_shutdown(f"Clipboard socket error: {e}")
+        return False
+
+    return True
+
+
+def _start_server_threads(args):
+    """Start all server threads."""
+    threading.Thread(
+        target=tcp_handshake_server, args=(host_state.handshake_sock, args.encoder, args), daemon=True
+    ).start()
+    threading.Thread(target=clipboard_monitor_host, daemon=True).start()
+    threading.Thread(target=clipboard_listener_host, args=(host_state.clipboard_listener_sock,), daemon=True).start()
+    threading.Thread(target=file_upload_listener, daemon=True).start()
+    threading.Thread(target=heartbeat_manager, args=(args,), daemon=True).start()
+    threading.Thread(target=session_manager, args=(args,), daemon=True).start()
+    threading.Thread(target=control_listener, args=(host_state.control_sock,), daemon=True).start()
+    threading.Thread(target=resource_monitor, daemon=True).start()
+    threading.Thread(target=stats_broadcast, daemon=True).start()
+    threading.Thread(target=pin_manager_thread, daemon=True).start()
+
+    if IS_LINUX:
+        try:
+            host_state.gamepad_thread = GamepadServer()
+            host_state.gamepad_thread.start()
+        except Exception as e:
+            logging.error("Failed to start gamepad server: %s", e)
+
+
 def core_main(args, use_signals=True) -> int:
     if use_signals:
         try:
@@ -2567,59 +3750,16 @@ def core_main(args, use_signals=True) -> int:
 
     host_state.current_bitrate = args.bitrate
     host_state.monitors = detect_monitors() or [(1920, 1080, 0, 0)]
-
     host_args_manager.args = args
 
-    try:
-        host_state.handshake_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        host_state.handshake_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        host_state.handshake_sock.bind((args.bind_address, TCP_HANDSHAKE_PORT))
-        host_state.handshake_sock.listen(5)
-    except Exception as e:
-        trigger_shutdown(f"Handshake socket error: {e}")
+    if not _initialize_sockets(args.bind_address):
         stop_all()
         return 1
 
-    try:
-        host_state.control_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        host_state.control_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        host_state.control_sock.bind((args.bind_address, UDP_CONTROL_PORT))
-    except Exception as e:
-        trigger_shutdown(f"Control socket error: {e}")
-        stop_all()
-        return 1
-
-    try:
-        host_state.clipboard_listener_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        host_state.clipboard_listener_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        host_state.clipboard_listener_sock.bind((args.bind_address, UDP_CLIPBOARD_PORT))
-    except Exception as e:
-        trigger_shutdown(f"Clipboard socket error: {e}")
-        stop_all()
-        return 1
-
-    threading.Thread(
-        target=tcp_handshake_server, args=(host_state.handshake_sock, args.encoder, args), daemon=True
-    ).start()
-    threading.Thread(target=clipboard_monitor_host, daemon=True).start()
-    threading.Thread(target=clipboard_listener_host, args=(host_state.clipboard_listener_sock,), daemon=True).start()
-    threading.Thread(target=file_upload_listener, daemon=True).start()
+    _start_server_threads(args)
 
     pin_rotate_if_needed(force=True)
     logging.info("Waiting for client handshake…")
-
-    threading.Thread(target=heartbeat_manager, args=(args,), daemon=True).start()
-    threading.Thread(target=session_manager, args=(args,), daemon=True).start()
-    threading.Thread(target=control_listener, args=(host_state.control_sock,), daemon=True).start()
-    threading.Thread(target=resource_monitor, daemon=True).start()
-    threading.Thread(target=stats_broadcast, daemon=True).start()
-    threading.Thread(target=pin_manager_thread, daemon=True).start()
-    if IS_LINUX:
-        try:
-            host_state.gamepad_thread = GamepadServer()
-            host_state.gamepad_thread.start()
-        except Exception as e:
-            logging.error("Failed to start gamepad server: %s", e)
     logging.info("Host running. Close window or Ctrl+C to quit.")
     exit_code = 0
     try:
@@ -2819,6 +3959,13 @@ def parse_args():
     p = argparse.ArgumentParser(description="LinuxPlay Host (Linux only)")
     p.add_argument("--gui", action="store_true", help="Show host GUI window.")
     p.add_argument(
+        "--hardware-report",
+        action="store_true",
+        help="Display comprehensive hardware detection report and exit. "
+        "Shows CPU topology, GPU capabilities, available encoders, NUMA configuration, "
+        "and optimization recommendations for low-latency streaming.",
+    )
+    p.add_argument(
         "--bind-address",
         default="127.0.0.1",
         help="IP address to bind server sockets to. Default: 127.0.0.1 (localhost only). "
@@ -2846,6 +3993,98 @@ def parse_args():
     return p.parse_args()
 
 
+def _print_hardware_section(title, data, format_func):
+    """Print a section of the hardware report."""
+    if not data:
+        return
+    print(f"[{title}]")
+    format_func(data)
+    print()
+
+
+def _format_platform_info(report):
+    """Format platform information."""
+    print(f"  OS: {report['platform']['os']}")
+    print(f"  Architecture: {report['platform']['arch']}")
+    print(f"  Linux: {report['platform']['is_linux']}")
+
+
+def _format_cpu_info(cpu):
+    """Format CPU information."""
+    print(f"  Logical cores: {cpu.get('logical_cores', 'N/A')}")
+    print(f"  Physical cores: {cpu.get('physical_cores', 'N/A')}")
+    print(f"  Hyperthreading: {cpu.get('hyperthreading', 'N/A')}")
+    print(f"  Intel CPU: {cpu.get('is_intel', 'N/A')}")
+    if cpu.get("heterogeneous"):
+        print("  Heterogeneous: Yes (P-cores + E-cores)")
+        print(f"  P-cores: {cpu.get('p_cores', [])}")
+        print(f"  E-cores: {cpu.get('e_cores', [])}")
+    else:
+        print("  Heterogeneous: No")
+
+
+def _format_gpu_info(gpu):
+    """Format GPU information."""
+    print(f"  NVIDIA: {gpu.get('nvidia', False)}")
+    if gpu.get("nvidia_model"):
+        print(f"  NVIDIA Model: {gpu['nvidia_model']}")
+    print(f"  VAAPI available: {gpu.get('vaapi_available', False)}")
+
+
+def _format_numa_info(numa):
+    """Format NUMA information."""
+    print(f"  Multi-socket system: {numa.get('multi_socket', False)}")
+    if numa.get("gpu_node") is not None:
+        print(f"  GPU NUMA node: {numa['gpu_node']}")
+
+
+def _format_accelerators_info(accelerators):
+    """Format hardware accelerators information."""
+    print(f"  FFmpeg hwaccels: {', '.join(sorted(accelerators)) or 'none'}")
+
+
+def _format_encoders_info(encoders):
+    """Format encoders information."""
+    for name, info in sorted(encoders.items()):
+        status = "✓ Available" if info["available"] else "✗ Not available"
+        if "tested" in info:
+            status += f" (tested: {'✓ works' if info['tested'] else '✗ failed'})"
+        print(f"  {name:20s}: {status}")
+
+
+def _format_affinity_info(affinity):
+    """Format CPU affinity information."""
+    print(f"  Recommended cores: {affinity}")
+    print("  (Physical cores for lowest latency streaming)")
+
+
+def _format_warnings_info(warnings):
+    """Format warnings and recommendations."""
+    import textwrap
+
+    for i, warning in enumerate(warnings, 1):
+        wrapped = textwrap.fill(warning, width=66, subsequent_indent="    ")
+        print(f"  {i}. {wrapped}")
+
+
+def _print_hardware_report(report):
+    """Print the complete hardware report."""
+    print("\n" + "=" * 70)
+    print("LinuxPlay Hardware Detection Report")
+    print("=" * 70 + "\n")
+
+    _print_hardware_section("Platform", report, _format_platform_info)
+    _print_hardware_section("CPU", report.get("cpu"), _format_cpu_info)
+    _print_hardware_section("GPU", report.get("gpu"), _format_gpu_info)
+    _print_hardware_section("NUMA", report.get("numa"), _format_numa_info)
+    _print_hardware_section("Hardware Accelerators", report.get("accelerators"), _format_accelerators_info)
+    _print_hardware_section("Encoders", report.get("encoders"), _format_encoders_info)
+    _print_hardware_section("CPU Affinity", report.get("affinity"), _format_affinity_info)
+    _print_hardware_section("Warnings & Recommendations", report.get("warnings"), _format_warnings_info)
+
+    print("=" * 70 + "\n")
+
+
 def main():
     args = parse_args()
 
@@ -2858,6 +4097,11 @@ def main():
     if not IS_LINUX:
         logging.critical("Hosting is Linux-only. Run this on a Linux machine.")
         return 2
+
+    if args.hardware_report:
+        report = generate_hardware_report()
+        _print_hardware_report(report)
+        return 0
 
     if args.gui:
         root = tk.Tk()

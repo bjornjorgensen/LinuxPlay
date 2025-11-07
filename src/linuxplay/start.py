@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
+from __future__ import annotations
+
 import argparse
 import contextlib
 import json
 import logging
 import os
-import platform
+import platform as py_platform
 import shutil
 import subprocess
 import sys
@@ -12,6 +14,7 @@ import threading
 import uuid
 from pathlib import Path
 
+import psutil
 from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtGui import QColor, QPalette
 from PyQt5.QtWidgets import (
@@ -32,126 +35,210 @@ from PyQt5.QtWidgets import (
 )
 
 
-HERE = Path(__file__).resolve().parent
+# Constants
+FFMPEG_OUTPUT_MIN_PARTS: int = 2  # Minimum parts when parsing ffmpeg output "d <name>"
+FFMPEG_CACHE_TTL: int = 300  # Cache encoder/device detection for 5 minutes
+WG_POLL_INTERVAL_MS: int = 1500  # WireGuard status check interval
+PROC_POLL_INTERVAL_MS: int = 1000  # Host process status check interval
+CERT_POLL_INTERVAL_MS: int = 2000  # Certificate detection check interval
+
+
+HERE: Path = Path(__file__).resolve().parent
 try:
     FFBIN = HERE / "ffmpeg" / "bin"
     if os.name == "nt" and (FFBIN / "ffmpeg.exe").exists():
         os.environ["PATH"] = str(FFBIN) + os.pathsep + os.environ.get("PATH", "")
-except Exception:
-    pass
+except (OSError, KeyError) as e:
+    logging.debug("FFmpeg path setup failed: %s", e)
 
-IS_WINDOWS = platform.system() == "Windows"
-IS_LINUX = platform.system() == "Linux"
-WG_INFO_PATH = Path("/tmp/linuxplay_wg_info.json")
-CFG_PATH = Path.home() / ".linuxplay_start_cfg.json"
-LINUXPLAY_MARKER = "LinuxPlayHost"
+IS_WINDOWS: bool = py_platform.system() == "Windows"
+IS_LINUX: bool = py_platform.system() == "Linux"
+WG_INFO_PATH: Path = Path("/tmp/linuxplay_wg_info.json")
+CFG_PATH: Path = Path.home() / ".linuxplay_start_cfg.json"
+LINUXPLAY_MARKER: str = "LinuxPlayHost"
 
 
-def _client_cert_present(base_dir):
+def _client_cert_present(base_dir: Path | str) -> bool:
+    """Check if client certificate and key files exist in directory.
+
+    Args:
+        base_dir: Directory containing client certificate files
+
+    Returns:
+        True if both client_cert.pem and client_key.pem exist
+    """
     try:
         base_path = Path(base_dir)
         cert_p = base_path / "client_cert.pem"
         key_p = base_path / "client_key.pem"
         return cert_p.exists() and key_p.exists()
-    except Exception:
+    except (OSError, TypeError, ValueError) as e:
+        logging.debug(f"Cert check failed for {base_dir}: {e}")
         return False
 
 
-def ffmpeg_ok():
+def ffmpeg_ok() -> bool:
+    """Check if ffmpeg command is available and working.
+
+    Returns:
+        True if ffmpeg is installed and responds to version check
+    """
     try:
         subprocess.check_output(
-            ["ffmpeg", "-hide_banner", "-version"], stderr=subprocess.STDOUT, universal_newlines=True
+            ["ffmpeg", "-hide_banner", "-version"],
+            stderr=subprocess.STDOUT,
+            universal_newlines=True,
+            timeout=5,  # Prevent hanging on broken FFmpeg installations
         )
         return True
-    except Exception:
+    except (subprocess.CalledProcessError, FileNotFoundError, OSError, subprocess.TimeoutExpired) as e:
+        logging.debug("FFmpeg check failed: %s", e)
         return False
 
 
-_FFENC_CACHE = {}
-_FFDEV_CACHE = {}
+_FFENC_CACHE: dict[str, bool] = {}
+_FFDEV_CACHE: dict[str, bool] = {}
 
 
-def ffmpeg_has_encoder(name):
+def ffmpeg_has_encoder(name: str) -> bool:
+    """Check if ffmpeg has specified encoder (cached).
+
+    Args:
+        name: Encoder name to check (e.g., 'h264_nvenc', 'libx264')
+
+    Returns:
+        True if encoder is available in FFmpeg build
+    """
     name = name.lower()
     if name in _FFENC_CACHE:
         return _FFENC_CACHE[name]
     try:
         out = subprocess.check_output(
-            ["ffmpeg", "-hide_banner", "-encoders"], stderr=subprocess.STDOUT, universal_newlines=True
+            ["ffmpeg", "-hide_banner", "-encoders"],
+            stderr=subprocess.STDOUT,
+            universal_newlines=True,
+            timeout=5,
         ).lower()
         _FFENC_CACHE[name] = name in out
         return _FFENC_CACHE[name]
-    except Exception:
+    except (subprocess.CalledProcessError, FileNotFoundError, OSError, subprocess.TimeoutExpired) as e:
+        logging.debug(f"Encoder check for '{name}' failed: {e}")
         _FFENC_CACHE[name] = False
         return False
 
 
-def ffmpeg_has_device(name):
+def ffmpeg_has_device(name: str) -> bool:
+    """Check if ffmpeg has specified input device (cached).
+
+    Args:
+        name: Device name to check (e.g., 'kmsgrab', 'x11grab')
+
+    Returns:
+        True if input device is available in FFmpeg build
+    """
     name = name.lower()
     if name in _FFDEV_CACHE:
         return _FFDEV_CACHE[name]
     try:
         out = subprocess.check_output(
-            ["ffmpeg", "-hide_banner", "-devices"], stderr=subprocess.STDOUT, universal_newlines=True
+            ["ffmpeg", "-hide_banner", "-devices"],
+            stderr=subprocess.STDOUT,
+            universal_newlines=True,
+            timeout=5,
         ).lower()
         found = False
         for line in out.splitlines():
             s = line.strip()
             if s.startswith(("d ", " d ")):
                 parts = s.split()
-                if len(parts) >= 2 and parts[1] == name:
+                if len(parts) >= FFMPEG_OUTPUT_MIN_PARTS and parts[1] == name:
                     found = True
                     break
         _FFDEV_CACHE[name] = found
         return found
-    except Exception:
+    except (subprocess.CalledProcessError, FileNotFoundError, OSError, subprocess.TimeoutExpired) as e:
+        logging.debug(f"Device check for '{name}' failed: {e}")
         _FFDEV_CACHE[name] = False
         return False
 
 
-def check_encoder_support(codec):
+def check_encoder_support(codec: str) -> bool:
+    """Check if FFmpeg has encoder support for specified codec (h.264 or h.265).
+
+    Args:
+        codec: Codec name ('h.264' or 'h.265')
+
+    Returns:
+        True if at least one encoder variant is available (hardware or software)
+    """
     key = codec.lower().replace(".", "")
     if key == "h264":
-        names = ["h264_nvenc", "h264_qsv", "h264_amf", "libx264", "h264_vaapi"]
+        names = ["h264_nvenc", "h264_qsv", "h264_amf", "h264_vaapi", "libx264"]
     elif key == "h265":
-        names = ["hevc_nvenc", "hevc_qsv", "hevc_amf", "libx265", "hevc_vaapi"]
+        names = ["hevc_nvenc", "hevc_qsv", "hevc_amf", "hevc_vaapi", "libx265"]
     else:
+        logging.debug(f"Unknown codec '{codec}' for encoder check")
         return False
+    # Check hardware encoders first (faster), then software fallback
     return any(ffmpeg_has_encoder(n) for n in names)
 
 
-def check_decoder_support(codec):
+def check_decoder_support(codec: str) -> bool:
+    """Check if FFmpeg has decoder support for specified codec (h.264 or h.265).
+
+    Args:
+        codec: Codec name ('h.264' or 'h.265')
+
+    Returns:
+        True if decoder is available in FFmpeg build
+    """
     try:
         output = subprocess.check_output(
-            ["ffmpeg", "-hide_banner", "-decoders"], stderr=subprocess.STDOUT, universal_newlines=True
+            ["ffmpeg", "-hide_banner", "-decoders"],
+            stderr=subprocess.STDOUT,
+            universal_newlines=True,
+            timeout=5,
         ).lower()
-    except Exception:
+    except (subprocess.CalledProcessError, FileNotFoundError, OSError, subprocess.TimeoutExpired) as e:
+        logging.debug(f"Decoder check for '{codec}' failed: {e}")
         return False
     key = codec.lower().replace(".", "")
     if key == "h264":
         return " h264 " in output or "\nh264\n" in output
     if key == "h265":
         return " hevc " in output or "\nhevc\n" in output
+    logging.debug(f"Unknown codec '{codec}' for decoder check")
     return False
 
 
-def load_cfg():
+def load_cfg() -> dict:
+    """Load launcher configuration from JSON file.
+
+    Returns:
+        Configuration dict or empty dict if file doesn't exist or is invalid
+    """
     try:
-        with CFG_PATH.open() as f:
+        with CFG_PATH.open(encoding="utf-8") as f:
             return json.load(f)
-    except Exception:
+    except (OSError, json.JSONDecodeError) as e:
+        logging.debug(f"Failed to load config: {e}")
         return {}
 
 
-def save_cfg(data):
+def save_cfg(data: dict) -> None:
+    """Save launcher configuration to JSON file.
+
+    Args:
+        data: Configuration dict to persist
+    """
     try:
-        with CFG_PATH.open("w") as f:
+        with CFG_PATH.open("w", encoding="utf-8") as f:
             json.dump(data, f, indent=2)
-    except Exception:
-        pass
+    except (OSError, TypeError) as e:
+        logging.warning(f"Failed to save config: {e}")
 
 
-ENCODER_NAME_MAP = {
+ENCODER_NAME_MAP: dict[tuple[str, str], str] = {
     ("h.264", "nvenc"): "h264_nvenc",
     ("h.264", "qsv"): "h264_qsv",
     ("h.264", "amf"): "h264_amf",
@@ -164,7 +251,7 @@ ENCODER_NAME_MAP = {
     ("h.265", "cpu"): "libx265",
 }
 
-BACKEND_READABLE = {
+BACKEND_READABLE: dict[str, str] = {
     "auto": "Auto (detect in host.py)",
     "cpu": "CPU (libx264/libx265/libaom)",
     "nvenc": "NVIDIA NVENC",
@@ -174,7 +261,15 @@ BACKEND_READABLE = {
 }
 
 
-def backends_for_codec(codec):
+def backends_for_codec(codec: str) -> tuple[list[str], list[str]]:
+    """Get available encoder backends for codec with human-readable labels.
+
+    Args:
+        codec: Codec name ('h.264' or 'h.265')
+
+    Returns:
+        Tuple of (backend_keys, display_labels) - both lists in same order
+    """
     base = ["auto", "cpu", "nvenc", "qsv", "amf", "vaapi"]
     if IS_WINDOWS:
         if "vaapi" in base:
@@ -193,52 +288,62 @@ def backends_for_codec(codec):
     return pruned, items
 
 
-def _proc_is_running(p):
+def _proc_is_running(p: subprocess.Popen | None) -> bool:
+    """Check if subprocess is still running.
+
+    Args:
+        p: Process object to check
+
+    Returns:
+        True if process exists and hasn't terminated
+    """
+    if p is None:
+        return False
     try:
-        return (p is not None) and (p.poll() is None)
-    except Exception:
+        return p.poll() is None
+    except (OSError, ValueError) as e:
+        logging.debug(f"Process check failed: {e}")
         return False
 
 
-def _ffmpeg_running_for_us(marker=LINUXPLAY_MARKER):
-    if IS_WINDOWS:
-        try:
-            out = subprocess.check_output(
-                [
-                    "powershell",
-                    "-NoProfile",
-                    "-Command",
-                    "Get-CimInstance Win32_Process -Filter \"Name='ffmpeg.exe'\" | Select-Object -Expand CommandLine",
-                ],
-                stderr=subprocess.DEVNULL,
-                universal_newlines=True,
-            )
-            for line in out.splitlines():
-                if marker in line:
+def _ffmpeg_running_for_us(marker: str = LINUXPLAY_MARKER) -> bool:
+    """Check if FFmpeg is running with our marker using psutil cross-platform API.
+
+    Args:
+        marker: Process marker to identify LinuxPlay FFmpeg instances
+
+    Returns:
+        True if at least one FFmpeg process with marker is running
+    """
+    try:
+        # Pre-define exceptions to avoid try-except overhead inside loop
+        error_types = (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess)
+        for proc in psutil.process_iter(["name", "cmdline"], error_types):
+            proc_name = proc.info.get("name")
+            if proc_name and "ffmpeg" in proc_name.lower():
+                cmdline = proc.info.get("cmdline", [])
+                if cmdline and any(marker in arg for arg in cmdline):
                     return True
-        except Exception:
-            pass
-        return False
-    try:
-        out = subprocess.check_output(["ps", "-eo", "pid,args"], universal_newlines=True)
-        for line in out.splitlines():
-            if "ffmpeg" in line and marker in line:
-                return True
-    except Exception:
-        pass
+    except (RuntimeError, KeyError, TypeError) as e:
+        logging.debug(f"FFmpeg process check failed: {e}")
     return False
 
 
-def _warn_ffmpeg(parent):
+def _warn_ffmpeg(parent: QWidget | None) -> None:
+    """Display critical warning dialog when FFmpeg is not available."""
     QMessageBox.critical(
         parent,
         "FFmpeg not found",
-        "FFmpeg was not found on PATH.\n\nWindows: keep ffmpeg\\bin next to the app or install FFmpeg.\nLinux: install ffmpeg via your package manager.",
+        "FFmpeg was not found on PATH.\n\n"
+        "Windows: keep ffmpeg\\bin next to the app or install FFmpeg.\n"
+        "Linux: install ffmpeg via your package manager.",
     )
 
 
 class HostTab(QWidget):
-    def __init__(self, parent=None):
+    """Host configuration tab for LinuxPlay launcher."""
+
+    def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         main_layout = QVBoxLayout()
         wg_group = QGroupBox("Security Status")
@@ -434,50 +539,69 @@ class HostTab(QWidget):
         self._exit_watcher_thread = None
         self.pollTimerWG = QTimer(self)
         self.pollTimerWG.timeout.connect(self.refresh_wg_status)
-        self.pollTimerWG.start(1500)
+        self.pollTimerWG.start(WG_POLL_INTERVAL_MS)
         self.procTimer = QTimer(self)
         self.procTimer.timeout.connect(self._poll_process_state)
-        self.procTimer.start(1000)
+        self.procTimer.start(PROC_POLL_INTERVAL_MS)
         self.profileChanged(0)
         self._refresh_backend_choices()
         self._load_saved()
         self._update_buttons()
 
-    def refresh_wg_status(self):
+    def refresh_wg_status(self) -> None:
+        """Update WireGuard status display (Linux only).
+
+        Checks WireGuard installation and tunnel status using native tools.
+        Priority: wg command → ip command fallback.
+        """
         if not IS_LINUX:
             self.wgStatus.setText("WireGuard: not supported on this OS")
             self.wgStatus.setStyleSheet("color: #bbb")
             return
+
+        # Check WireGuard status using native tools
         active = False
         installed = shutil.which("wg") is not None
+
         if installed:
+            # Primary method: wg command
             try:
-                out = subprocess.check_output(["wg", "show"], stderr=subprocess.DEVNULL, universal_newlines=True)
+                out = subprocess.check_output(
+                    ["wg", "show"],
+                    stderr=subprocess.DEVNULL,
+                    universal_newlines=True,
+                    timeout=2,
+                )
                 active = "interface:" in out
-            except subprocess.CalledProcessError:
+            except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
                 pass
         else:
+            # Fallback: ip command (kernel-level check)
             try:
                 out = subprocess.check_output(
                     ["ip", "-d", "link", "show", "type", "wireguard"],
                     stderr=subprocess.DEVNULL,
                     universal_newlines=True,
+                    timeout=2,
                 )
                 active = bool(out.strip())
                 installed = True
-            except Exception:
+            except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError, FileNotFoundError):
                 pass
+
+        # Update UI based on status
         if active:
             self.wgStatus.setText("WireGuard detected and active")
-            self.wgStatus.setStyleSheet("color: #7CFC00")
+            self.wgStatus.setStyleSheet("color: #7CFC00")  # Lawn green
         elif installed:
             self.wgStatus.setText("WireGuard installed, no active tunnel")
-            self.wgStatus.setStyleSheet("color: #f44")
+            self.wgStatus.setStyleSheet("color: #f44")  # Red warning
         else:
             self.wgStatus.setText("WireGuard not installed")
-            self.wgStatus.setStyleSheet("color: #f44")
+            self.wgStatus.setStyleSheet("color: #f44")  # Red warning
 
-    def profileChanged(self, _idx):
+    def profileChanged(self, _idx: int) -> None:
+        """Update UI controls when profile preset is changed."""
         profile = self.profileCombo.currentText()
         if profile == "Lowest Latency":
             self.encoderCombo.setCurrentText("h.264" if self.encoderCombo.findText("h.264") != -1 else "none")
@@ -536,7 +660,8 @@ class HostTab(QWidget):
             self.pixFmtCombo.setCurrentText("yuv420p")
             self._refresh_backend_choices(preselect="auto")
 
-    def _refresh_backend_choices(self, preselect=None):
+    def _refresh_backend_choices(self, preselect: str | None = None) -> None:
+        """Update hardware encoder backend choices based on selected codec."""
         codec = self.encoderCombo.currentText()
         self.hwencCombo.clear()
         if codec == "none":
@@ -562,12 +687,14 @@ class HostTab(QWidget):
             idx = 0
         self.hwencCombo.setCurrentIndex(idx)
 
-    def _poll_process_state(self):
+    def _poll_process_state(self) -> None:
+        """Poll host process state and update internal tracking."""
         if self.host_process is not None and self.host_process.poll() is not None:
             self.host_process = None
         self._update_buttons()
 
-    def _update_buttons(self):
+    def _update_buttons(self) -> None:
+        """Update button states based on host and FFmpeg process status."""
         running_host = _proc_is_running(self.host_process)
         running_ffmpeg = _ffmpeg_running_for_us()
         can_start = not (running_host or running_ffmpeg)
@@ -582,19 +709,20 @@ class HostTab(QWidget):
             self.startButton.setToolTip("Start the host.")
             self.statusLabel.setText("Ready")
 
-    def start_host(self):
+    def _validate_host_start(self) -> tuple[bool, str | None]:
+        """Validate host start conditions. Returns (success, encoder) tuple."""
         if not IS_LINUX:
             QMessageBox.critical(
                 self,
                 "Unsupported OS",
                 "Hosting is only supported on Linux. Use the Client tab instead.",
             )
-            return
+            return False, None
 
         if not ffmpeg_ok():
             _warn_ffmpeg(self)
             self._update_buttons()
-            return
+            return False, None
 
         encoder = self.encoderCombo.currentText()
         if encoder == "none":
@@ -604,24 +732,29 @@ class HostTab(QWidget):
                 "Encoder is set to 'none'. Pick h.264 or h.265 before starting the host.",
             )
             self._update_buttons()
-            return
+            return False, None
 
-        framerate = self.framerateCombo.currentText()
-        bitrate = self.bitrateCombo.currentText()
-        audio = self.audioCombo.currentText()
-        adaptive = self.adaptiveCheck.isChecked()
-        display = self.displayCombo.currentText()
+        return True, encoder
 
-        preset = "" if self.presetCombo.currentText() in ("Default", "None") else self.presetCombo.currentText()
-        gop = self.gopCombo.currentText()
-        qp_val = self.qpCombo.currentText()
-        qp = "" if qp_val in ("None", "", None) else qp_val
-        tune_val = self.tuneCombo.currentText()
-        tune = "" if tune_val in ("None", "", None) else tune_val
-        pix_fmt = self.pixFmtCombo.currentText()
-        debug = self.debugCheck.isChecked()
-        hwenc = self.hwencCombo.currentData() or "auto"
+    def _get_host_parameters(self) -> dict[str, str | bool]:
+        """Extract host parameters from UI controls."""
+        return {
+            "framerate": self.framerateCombo.currentText(),
+            "bitrate": self.bitrateCombo.currentText(),
+            "audio": self.audioCombo.currentText(),
+            "adaptive": self.adaptiveCheck.isChecked(),
+            "display": self.displayCombo.currentText(),
+            "preset": "" if self.presetCombo.currentText() in ("Default", "None") else self.presetCombo.currentText(),
+            "gop": self.gopCombo.currentText(),
+            "qp": "" if self.qpCombo.currentText() in ("None", "", None) else self.qpCombo.currentText(),
+            "tune": "" if self.tuneCombo.currentText() in ("None", "", None) else self.tuneCombo.currentText(),
+            "pix_fmt": self.pixFmtCombo.currentText(),
+            "debug": self.debugCheck.isChecked(),
+            "hwenc": self.hwencCombo.currentData() or "auto",
+        }
 
+    def _build_host_command(self, encoder: str, params: dict[str, str | bool]) -> list[str]:
+        """Build the host command line."""
         cmd = [
             sys.executable,
             str(HERE / "host.py"),
@@ -629,46 +762,49 @@ class HostTab(QWidget):
             "--encoder",
             encoder,
             "--framerate",
-            framerate,
+            params["framerate"],
             "--bitrate",
-            bitrate,
+            params["bitrate"],
             "--audio",
-            audio,
+            params["audio"],
             "--pix_fmt",
-            pix_fmt,
+            params["pix_fmt"],
             "--hwenc",
-            hwenc,
+            params["hwenc"],
         ]
 
-        if adaptive:
+        if params["adaptive"]:
             cmd.append("--adaptive")
-        if preset:
-            cmd.extend(["--preset", preset])
-        if qp:
-            cmd.extend(["--qp", qp])
-        if tune:
-            cmd.extend(["--tune", tune])
-        if debug:
+        if params["preset"]:
+            cmd.extend(["--preset", params["preset"]])
+        if params["qp"]:
+            cmd.extend(["--qp", params["qp"]])
+        if params["tune"]:
+            cmd.extend(["--tune", params["tune"]])
+        if params["debug"]:
             cmd.append("--debug")
-        cmd.extend(["--display", display])
+        cmd.extend(["--display", params["display"]])
 
+        # Handle GOP setting
         try:
-            _gop_i = int(gop)
+            gop_i = int(params["gop"])
         except Exception:
-            _gop_i = 0
-        if _gop_i > 0:
-            cmd.extend(["--gop", str(_gop_i)])
-        elif preset.lower() in ("llhp", "zerolatency", "ultra-low-latency", "ull"):
+            gop_i = 0
+        if gop_i > 0:
+            cmd.extend(["--gop", str(gop_i)])
+        elif params["preset"].lower() in ("llhp", "zerolatency", "ultra-low-latency", "ull"):
             cmd.extend(["--gop", "1"])
 
-        self._save_current()
+        return cmd
 
+    def _setup_host_environment(self) -> dict[str, str]:
+        """Setup environment variables for host process."""
         env = os.environ.copy()
         env["LINUXPLAY_MARKER"] = LINUXPLAY_MARKER
         env["LINUXPLAY_SID"] = env.get("LINUXPLAY_SID") or str(uuid.uuid4())
 
-        _am = self.audioModeCombo.currentText().lower()
-        if "music" in _am:
+        audio_mode = self.audioModeCombo.currentText().lower()
+        if "music" in audio_mode:
             env["LP_OPUS_APP"] = "audio"
             env["LP_OPUS_FD"] = "20"
         else:
@@ -676,14 +812,30 @@ class HostTab(QWidget):
             env["LP_OPUS_FD"] = "10"
 
         cap_mode = getattr(self, "linuxCaptureCombo", None)
-        cap_val = cap_mode.currentData() if cap_mode else "auto"
-        env["LINUXPLAY_CAPTURE"] = cap_val or "auto"
+        if cap_mode:
+            env["LINUXPLAY_CAPTURE"] = cap_mode.currentData() or "auto"
+        else:
+            env["LINUXPLAY_CAPTURE"] = "auto"
 
         kms_dev = getattr(self, "kmsDeviceEdit", None)
         if kms_dev and hasattr(kms_dev, "text"):
             val = kms_dev.text().strip()
             if val:
                 env["LINUXPLAY_KMS_DEVICE"] = val
+
+        return env
+
+    def start_host(self) -> None:
+        """Start host process with current configuration."""
+        valid, encoder = self._validate_host_start()
+        if not valid:
+            return
+
+        params = self._get_host_parameters()
+        cmd = self._build_host_command(encoder, params)
+        env = self._setup_host_environment()
+
+        self._save_current()
 
         try:
             self.host_process = subprocess.Popen(
@@ -714,7 +866,8 @@ class HostTab(QWidget):
         self._exit_watcher_thread.start()
         self._update_buttons()
 
-    def _save_current(self):
+    def _save_current(self) -> None:
+        """Save current host configuration to disk."""
         data = load_cfg()
         data["host"] = {
             "profile": self.profileCombo.currentText(),
@@ -735,12 +888,13 @@ class HostTab(QWidget):
         }
         save_cfg(data)
 
-    def _load_saved(self):
+    def _load_saved(self) -> None:
+        """Load saved host configuration from disk."""
         cfg = load_cfg().get("host", {})
         if not cfg:
             return
 
-        def set_combo(combo, val):
+        def set_combo(combo: QComboBox, val: str | None) -> None:
             if not val:
                 return
             idx = combo.findText(val)
@@ -774,7 +928,9 @@ class HostTab(QWidget):
 
 
 class ClientTab(QWidget):
-    def __init__(self, parent=None):
+    """Client configuration tab for LinuxPlay launcher."""
+
+    def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         main_layout = QVBoxLayout()
 
@@ -858,7 +1014,7 @@ class ClientTab(QWidget):
 
         self._cert_refresh_timer = QTimer(self)
         self._cert_refresh_timer.timeout.connect(self._refresh_cert_detection)
-        self._cert_refresh_timer.start(2000)
+        self._cert_refresh_timer.start(CERT_POLL_INTERVAL_MS)
 
         form_group.setLayout(form_layout)
         button_layout = QHBoxLayout()
@@ -871,7 +1027,8 @@ class ClientTab(QWidget):
         main_layout.addStretch()
         self.setLayout(main_layout)
 
-    def _apply_cert_ui_state(self, has_cert: bool):
+    def _apply_cert_ui_state(self, has_cert: bool) -> None:
+        """Update PIN field UI based on certificate detection."""
         if has_cert:
             self.pinEdit.clear()
             self.pinEdit.setEnabled(False)
@@ -882,21 +1039,27 @@ class ClientTab(QWidget):
             self.pinEdit.setPlaceholderText("Enter 6-digit host PIN")
             self.pinEdit.setToolTip("Enter PIN shown on host display.")
 
-    def _refresh_cert_detection(self):
+    def _refresh_cert_detection(self) -> None:
+        """Periodically check for certificate changes and update UI.
+
+        Detects when certificates are added/removed and updates PIN field accordingly.
+        """
         try:
             now_has = _client_cert_present(HERE)
-        except Exception:
+        except Exception as e:
+            logging.debug("Certificate detection failed: %s", e)
             now_has = False
         if now_has != getattr(self, "_cert_auth", False):
             self._cert_auth = now_has
             self._apply_cert_ui_state(now_has)
             state = "detected" if now_has else "removed"
-            logging.info(f"[AUTO] Client certificate {state}, UI updated.")
+            logging.info("[AUTO] Client certificate %s, UI updated.", state)
 
-    def _load_saved_client_extras(self):
+    def _load_saved_client_extras(self) -> None:
+        """Load saved client configuration from disk."""
         cfg = load_cfg().get("client", {})
 
-        def set_combo(combo, val):
+        def set_combo(combo: QComboBox, val: str | None) -> None:
             if not val:
                 return
             idx = combo.findText(val)
@@ -913,7 +1076,11 @@ class ClientTab(QWidget):
         set_combo(self.gamepadCombo, cfg.get("gamepad", "enable"))
         self.gamepadDevEdit.setText(cfg.get("gamepad_dev", ""))
 
-    def start_client(self):
+    def start_client(self) -> None:
+        """Start client process with current configuration.
+
+        Validates configuration and launches client.py with appropriate flags.
+        """
         if not ffmpeg_ok():
             _warn_ffmpeg(self)
             return
@@ -930,10 +1097,15 @@ class ClientTab(QWidget):
         gamepad_dev = self.gamepadDevEdit.text().strip() or None
         pin = self.pinEdit.text().strip()
         if getattr(self, "_cert_auth", False):
-            pin = ""
+            pin = ""  # Certificate auth bypasses PIN
 
         if not host_ip:
-            self.hostIPEdit.setEditText("Enter host IP or WG tunnel IP")
+            QMessageBox.warning(
+                self,
+                "Missing Host IP",
+                "Please enter the host IP address or WireGuard tunnel IP.",
+            )
+            self.hostIPEdit.setFocus()
             return
 
         cfg = load_cfg()
@@ -988,14 +1160,22 @@ class ClientTab(QWidget):
             cmd.extend(["--pin", pin])
 
         try:
-            subprocess.Popen(cmd)
-        except Exception as e:
+            subprocess.Popen(
+                cmd,
+                start_new_session=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            logging.info(f"Client started successfully with host {host_ip}")
+        except (OSError, ValueError) as e:
             logging.error(f"Failed to start client: {e}")
             QMessageBox.critical(self, "Start Client Failed", str(e))
 
 
 class HelpTab(QWidget):
-    def __init__(self, parent=None):
+    """Help and documentation tab for LinuxPlay launcher."""
+
+    def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         layout = QVBoxLayout()
 
@@ -1028,7 +1208,8 @@ class HelpTab(QWidget):
             "</ul>"
             "<h2>General Notes</h2>"
             "<ul>"
-            "<li>Multi-monitor streaming is supported. Choose a specific monitor index or <b>all</b> to capture every display.</li>"
+            "<li>Multi-monitor streaming is supported. "
+            "Choose a specific monitor index or <b>all</b> to capture every display.</li>"
             "<li>The host window includes a Stop button; closing it also terminates the active session safely.</li>"
             "<li>Clipboard sync and drag-and-drop are available in compatible clients.</li>"
             "</ul>"
@@ -1042,7 +1223,9 @@ class HelpTab(QWidget):
 
 
 class StartWindow(QWidget):
-    def __init__(self):
+    """Main launcher window for LinuxPlay with tabbed interface."""
+
+    def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("LinuxPlay")
         self.tabs = QTabWidget()
@@ -1057,11 +1240,13 @@ class StartWindow(QWidget):
         main_layout.addWidget(self.tabs)
         self.setLayout(main_layout)
 
-    def closeEvent(self, event):
+    def closeEvent(self, event) -> None:
+        """Handle window close event."""
         event.accept()
 
 
-def main():
+def main() -> None:
+    """Main entry point for LinuxPlay launcher GUI."""
     parser = argparse.ArgumentParser()
     parser.add_argument("--debug", action="store_true")
     args, _ = parser.parse_known_args()
