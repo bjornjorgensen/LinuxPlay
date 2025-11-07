@@ -573,8 +573,9 @@ class HostTab(QWidget):
                     timeout=2,
                 )
                 active = "interface:" in out
-            except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
-                pass
+            except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as e:
+                # WireGuard command failed - fallback to ip command
+                logging.debug(f"WireGuard 'wg' command failed: {e}")
         else:
             # Fallback: ip command (kernel-level check)
             try:
@@ -586,8 +587,9 @@ class HostTab(QWidget):
                 )
                 active = bool(out.strip())
                 installed = True
-            except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError, FileNotFoundError):
-                pass
+            except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError, FileNotFoundError) as e:
+                # WireGuard detection failed - neither 'wg' nor 'ip' commands worked
+                logging.debug(f"WireGuard 'ip' command failed: {e}")
 
         # Update UI based on status
         if active:
@@ -967,8 +969,9 @@ class ClientTab(QWidget):
                 t_ip = info.get("host_tunnel_ip", "")
                 if t_ip:
                     self.hostIPEdit.addItem(t_ip)
-            except Exception:
-                pass
+            except Exception as e:
+                # WireGuard config file parse failed - may be corrupted or invalid JSON
+                logging.debug(f"Failed to load WireGuard config from {WG_INFO_PATH}: {e}")
 
         last = load_cfg().get("client", {})
         for ip in last.get("recent_ips", []):

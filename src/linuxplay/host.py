@@ -2740,8 +2740,9 @@ def _handle_legacy_certfp_auth(conn, peer_ip, parts, encoder_str):
         conn.sendall(b"FAIL:UNTRUSTEDCERT")
         conn.shutdown(socket.SHUT_WR)
         time.sleep(0.05)
-    except Exception:
-        pass
+    except Exception as e:
+        # Socket already closed by client or network error - expected during cleanup
+        logging.debug(f"[AUTH] Socket cleanup failed for {peer_ip}: {e}")
     logging.warning(f"[AUTH] Rejected cert from {peer_ip} — not trusted")
     return False
 
@@ -2758,8 +2759,9 @@ def _handle_legacy_pin_auth(conn, peer_ip, parts, encoder_str):
             conn.sendall(f"FAIL:RATELIMIT:{reason}".encode())
             conn.shutdown(socket.SHUT_WR)
             time.sleep(0.05)
-        except Exception:
-            pass
+        except Exception as e:
+            # Socket already closed by client or network error - expected during cleanup
+            logging.debug(f"[AUTH] Socket cleanup failed for {peer_ip}: {e}")
         return False
 
     ok = False
@@ -2813,8 +2815,9 @@ def _handle_legacy_pin_auth(conn, peer_ip, parts, encoder_str):
         conn.sendall(reply)
         conn.shutdown(socket.SHUT_WR)
         time.sleep(0.05)
-    except Exception:
-        pass
+    except Exception as e:
+        # Socket already closed by client or network error - expected during cleanup
+        logging.debug(f"[AUTH] Socket cleanup failed: {e}")
     return False
 
 
@@ -3400,8 +3403,9 @@ def resource_monitor():
             handle = pynvml.nvmlDeviceGetHandleByIndex(0)
             util = pynvml.nvmlDeviceGetUtilizationRates(handle)
             return f"GPU: {util.gpu}% VRAM: {util.memory}% (NVENC)"
-        except Exception:
-            pass
+        except Exception as e:
+            # NVIDIA GPU not available or NVML error - try fallback methods
+            logging.debug(f"NVML GPU detection failed: {e}")
 
         try:
             for card in Path("/sys/class/drm").iterdir():
@@ -3410,8 +3414,9 @@ def resource_monitor():
                     with busy_path.open() as f:
                         val = f.read().strip()
                         return f"GPU: {val}% (VAAPI)"
-        except Exception:
-            pass
+        except Exception as e:
+            # DRM GPU detection failed - GPU stats unavailable
+            logging.debug(f"DRM GPU detection failed: {e}")
 
         try:
             cmd = ["timeout", "0.5", "intel_gpu_top", "-J"]
@@ -3420,8 +3425,9 @@ def resource_monitor():
                 j = json.loads(out)
                 busy = j["engines"]["Render/3D/0"]["busy"]
                 return f"GPU: {busy}% (iGPU)"
-        except Exception:
-            pass
+        except Exception as e:
+            # intel_gpu_top command failed or JSON parse error - GPU stats unavailable
+            logging.debug(f"intel_gpu_top detection failed: {e}")
 
         return ""
 
@@ -3480,8 +3486,9 @@ def stats_broadcast():
                 fps = getattr(host_state, "current_fps", 0)
                 msg = f"STATS {cpu:.1f} {gpu:.1f} {mem:.1f} {fps:.1f}"
                 sock.sendto(msg.encode("utf-8"), (host_state.client_ip, UDP_HEARTBEAT_PORT))
-            except Exception:
-                pass
+            except Exception as e:
+                # Stats broadcast failed - client may be disconnected
+                logging.debug(f"Stats broadcast failed: {e}")
         time.sleep(1)
 
 
@@ -3650,21 +3657,24 @@ class GamepadServer(threading.Thread):
         try:
             if self.ui:
                 self.ui.close()
-        except Exception:
-            pass
+        except Exception as e:
+            # UI device cleanup failed - may already be closed
+            logging.debug(f"Gamepad UI cleanup failed: {e}")
         try:
             if self.sock:
                 self.sock.close()
-        except Exception:
-            pass
+        except Exception as e:
+            # Socket cleanup failed - may already be closed
+            logging.debug(f"Gamepad socket cleanup failed: {e}")
 
     def stop(self):
         self._running = False
         try:
             if self.sock:
                 self.sock.close()
-        except Exception:
-            pass
+        except Exception as e:
+            # Socket already closed - expected during cleanup
+            logging.debug(f"Gamepad socket stop failed: {e}")
 
 
 def session_manager(args):
@@ -3745,8 +3755,9 @@ def core_main(args, use_signals=True) -> int:
         try:
             for _sig in (signal.SIGINT, signal.SIGTERM):
                 signal.signal(_sig, _signal_handler)
-        except Exception:
-            pass
+        except Exception as e:
+            # Signal registration failed - may be in non-main thread or unsupported platform
+            logging.debug(f"Signal handler registration failed: {e}")
 
     logging.debug("FFmpeg marker in use: %s", _marker_value())
 
