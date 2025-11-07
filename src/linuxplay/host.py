@@ -512,6 +512,7 @@ def log_performance_metrics():
                     total_mem_mb += ps.memory_info().rss / (1024 * 1024)
                     process_count += 1
                 except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    # Process disappeared or access denied during monitoring - safe to ignore
                     pass
 
     logging.info(
@@ -2705,6 +2706,7 @@ def _handle_legacy_certfp_auth(conn, peer_ip, parts, encoder_str):
             conn.shutdown(socket.SHUT_WR)
             time.sleep(0.05)
         except Exception:
+            # Socket may already be closed by client - this is expected when rejecting connection
             pass
         logging.warning(f"[AUTH] Rejected CERTFP client {peer_ip} — active session")
         return False
@@ -2839,6 +2841,7 @@ def tcp_handshake_server(sock, encoder_str, _args):
                     conn.shutdown(socket.SHUT_WR)
                     time.sleep(0.05)
                 except Exception:
+                    # Socket may already be closed by client - this is expected when rejecting connection
                     pass
                 conn.close()
                 continue

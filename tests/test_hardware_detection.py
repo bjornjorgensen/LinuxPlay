@@ -187,7 +187,8 @@ class TestQSVDetection:
         monkeypatch.setattr("linuxplay.host.ffmpeg_has_encoder", mock_has_encoder)
 
         # Mock no NVIDIA
-        monkeypatch.setattr("linuxplay.host.has_nvidia", lambda: False)
+        from unittest.mock import Mock
+        monkeypatch.setattr("linuxplay.host.has_nvidia", Mock(return_value=False))
 
         # QSV should be detected as available
         hwaccels = mock_hwaccels()
@@ -547,7 +548,8 @@ class TestHardwareReport:
         monkeypatch.setattr("linuxplay.host.ffmpeg_has_encoder", mock_has_encoder)
 
         # Mock QSV test to return False
-        monkeypatch.setattr("linuxplay.host.test_qsv_encode", lambda: False)
+        from unittest.mock import Mock
+        monkeypatch.setattr("linuxplay.host.test_qsv_encode", Mock(return_value=False))
 
         report = generate_hardware_report()
 
@@ -567,10 +569,11 @@ class TestHardwareReport:
         def mock_has_encoder(name):
             return "libx" in name  # Only CPU encoders
 
+        from unittest.mock import Mock
         monkeypatch.setattr("linuxplay.host.ffmpeg_has_encoder", mock_has_encoder)
-        monkeypatch.setattr("linuxplay.host.has_nvidia", lambda: False)
-        monkeypatch.setattr("linuxplay.host.has_vaapi", lambda: False)
-        monkeypatch.setattr("linuxplay.host.ffmpeg_hwaccels", lambda: set())
+        monkeypatch.setattr("linuxplay.host.has_nvidia", Mock(return_value=False))
+        monkeypatch.setattr("linuxplay.host.has_vaapi", Mock(return_value=False))
+        monkeypatch.setattr("linuxplay.host.ffmpeg_hwaccels", Mock(return_value=set()))
 
         report = generate_hardware_report()
 

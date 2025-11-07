@@ -130,6 +130,7 @@ def _ask_pin(title: str = "Enter Host PIN", prompt: str = "6-digit PIN (rotates 
         root.destroy()
         return (result or "").strip()
     except Exception:
+        # Tkinter dialog failure (missing display, X11 error) - error already logged
         logging.error("PIN dialog failed")
         return ""
 
@@ -192,6 +193,7 @@ def _probe_hardware_capabilities():
         vk_spec = importlib.util.find_spec("vulkan")
         vk_available = vk_spec is not None
     except Exception:
+        # Vulkan module not available - graceful degradation to non-Vulkan mode
         vk_available = False
 
     gbm_exists = any(Path(p).exists() for p in ("/dev/dri/renderD128", "/dev/dri/renderD129"))
@@ -214,6 +216,7 @@ def ffmpeg_hwaccels():
                 accels.add(name)
         return accels
     except Exception:
+        # FFmpeg not available or command failed - return empty set for software fallback
         return set()
 
 
@@ -287,6 +290,7 @@ def _detect_windows_network_mode() -> str:
                 return "wifi"
         return "lan"
     except Exception:
+        # psutil network detection failed - assume LAN for performance
         return "lan"
 
 
@@ -308,6 +312,7 @@ def _read_pem_cert_fingerprint(pem_path: str) -> str:
         der = base64.b64decode("".join(m.group(1).split()))
         return hashlib.sha256(der).hexdigest().upper()
     except Exception:
+        # Certificate file missing or malformed - return empty string for auth fallback
         return ""
 
 
@@ -472,6 +477,7 @@ def _get_client_paths():
     try:
         client_dir = Path.home() / ".linuxplay"
     except Exception:
+        # Path.home() failure (rare) - fallback to same path (will fail downstream with clear error)
         client_dir = Path.home() / ".linuxplay"
 
     return (
@@ -1063,6 +1069,7 @@ class DecoderThread(QThread):
             if hasattr(p, "buffer_ptr") and isinstance(p.buffer_ptr, int):
                 return p.buffer_ptr
         except Exception:
+            # DMA-BUF extraction failed (driver/hardware incompatibility) - fall back to CPU decode
             pass
         return None
 
@@ -1158,6 +1165,7 @@ class DecoderThread(QThread):
                     if container:
                         container.close()
                 except Exception:
+                    # Container already closed or cleanup failed - ignore during shutdown
                     pass
 
     def stop(self):
@@ -1197,6 +1205,7 @@ class RenderKMSDRM(RenderBackend):
                     self.valid = True
                     break
                 except Exception:
+                    # DRM device open failed (permission/busy) - try next device
                     continue
 
         if not self.valid:
@@ -1325,6 +1334,7 @@ class RenderVulkan(RenderBackend):
         try:
             self.valid = True
         except Exception:
+            # Vulkan initialization failed - backend not available
             self.valid = False
 
     def is_valid(self):
@@ -1464,6 +1474,7 @@ class VideoWidgetGL(QOpenGLWidget):
             with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
                 sock.sendto(msg, (self.host_ip, UDP_CLIPBOARD_PORT))
         except Exception:
+            # Clipboard sync failed (network error) - non-critical, skip update
             pass
 
     def initializeGL(self):
@@ -1729,6 +1740,7 @@ class VideoWidgetGL(QOpenGLWidget):
             try:
                 return chr(key).lower()
             except Exception:
+                # Character conversion failed for special key code - return text fallback
                 pass
         return text or None
 
@@ -1758,6 +1770,7 @@ class GamepadThread(threading.Thread):
             try:
                 return InputDevice(self.path_hint)
             except Exception:
+                # Path hint invalid (device disconnected/removed) - fall back to auto-detection
                 return None
         candidates = []
         for p in list_devices():
@@ -1771,6 +1784,7 @@ class GamepadThread(threading.Thread):
                 if any(n for (typ, codes) in caps for (code, n) in (codes or []) if n.startswith(("BTN_", "ABS_"))):
                     candidates.append(d)
             except Exception:
+                # Device read failed (permission/disconnect) - skip this device
                 pass
         if not candidates:
             return None
@@ -1787,6 +1801,7 @@ class GamepadThread(threading.Thread):
                 if any((codes or []) for (_t, codes) in caps):
                     s += 1
             except Exception:
+                # Device capabilities read failed - return current score without bonus
                 pass
             return s
 
@@ -1797,10 +1812,6 @@ class GamepadThread(threading.Thread):
         if not IS_LINUX:
             return
         if not HAVE_EVDEV:
-            return
-        try:
-            pass
-        except Exception:
             return
 
         dev = self._find_device()
@@ -1825,6 +1836,7 @@ class GamepadThread(threading.Thread):
                     with contextlib.suppress(Exception):
                         sendto(pack_event(t, c, v), addr)
         except Exception:
+            # Gamepad device disconnected or read error - exit thread gracefully
             pass
 
         with contextlib.suppress(Exception):
@@ -1990,6 +2002,7 @@ class MainWindow(QMainWindow):
             util = pynvml.nvmlDeviceGetUtilizationRates(handle)
             return f"{util.gpu}% (NVENC)"
         except Exception:
+            # NVML init failed (no NVIDIA GPU or driver) - try VAAPI
             pass
 
         try:
@@ -1999,6 +2012,7 @@ class MainWindow(QMainWindow):
                     val = busy_path.read_text().strip()
                     return f"{val}% (VAAPI)"
         except Exception:
+            # sysfs read failed (permission/driver issue) - try intel_gpu_top
             pass
 
         try:
@@ -2009,6 +2023,7 @@ class MainWindow(QMainWindow):
                 busy = j["engines"]["Render/3D/0"]["busy"]
                 return f"{busy}% (iGPU)"
         except Exception:
+            # intel_gpu_top not installed or failed - return N/A
             pass
 
         return "N/A"
@@ -2201,6 +2216,7 @@ def _setup_logging(debug: bool):
         file_handler.setFormatter(logging.Formatter(log_format, datefmt=log_datefmt))
         root_logger.addHandler(file_handler)
     except Exception:
+        # File logging setup failed (permission/disk full) - console logging still works
         pass
 
 
@@ -2328,6 +2344,7 @@ def main():
         ps = psutil.Process(os.getpid())
         ps.nice(-5)
     except Exception:
+        # Process priority adjustment failed (insufficient permissions) - continue with default priority
         pass
 
     _setup_logging(args.debug)
