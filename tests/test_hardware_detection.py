@@ -188,6 +188,7 @@ class TestQSVDetection:
 
         # Mock no NVIDIA
         from unittest.mock import Mock
+
         monkeypatch.setattr("linuxplay.host.has_nvidia", Mock(return_value=False))
 
         # QSV should be detected as available
@@ -549,6 +550,7 @@ class TestHardwareReport:
 
         # Mock QSV test to return False
         from unittest.mock import Mock
+
         monkeypatch.setattr("linuxplay.host.test_qsv_encode", Mock(return_value=False))
 
         report = generate_hardware_report()
@@ -570,6 +572,7 @@ class TestHardwareReport:
             return "libx" in name  # Only CPU encoders
 
         from unittest.mock import Mock
+
         monkeypatch.setattr("linuxplay.host.ffmpeg_has_encoder", mock_has_encoder)
         monkeypatch.setattr("linuxplay.host.has_nvidia", Mock(return_value=False))
         monkeypatch.setattr("linuxplay.host.has_vaapi", Mock(return_value=False))
