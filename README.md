@@ -5,7 +5,7 @@
 ![License: GPLv2](https://img.shields.io/badge/License-GPLv2-blue.svg)
 ![Platform: Linux Host](https://img.shields.io/badge/Host-Linux-green.svg)
 ![Platform: Windows Client](https://img.shields.io/badge/Client-Windows%20%7C%20Linux-blue.svg)
-![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-blue)
+![Python 3.11+](https://img.shields.io/badge/Python-3.11%2B-blue)
 ![FFmpeg](https://img.shields.io/badge/FFmpeg-Required-critical)
 
 ---
@@ -80,12 +80,12 @@ TCP upload (7003)      --------------------->  File upload handler
 
 **Host (Linux):**
 - Ubuntu 22.04+ (or equivalent)
-- Python 3.10 or higher
+- Python 3.11 or higher
 - FFmpeg with hardware encoding support
 - X11 or Wayland display server
 
 **Client (Linux or Windows):**
-- Python 3.10 or higher
+- Python 3.11 or higher
 - FFmpeg for audio playback
 - OpenGL 3.0+ support
 - PyQt5 for GUI (optional, CLI available)
