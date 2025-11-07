@@ -2018,9 +2018,6 @@ def _pick_encoder_args(codec: str, hwenc: str, preset: str, gop: str, qp: str, t
     adaptive = getattr(host_args_manager.args, "adaptive", False)
     dynamic_flags = _build_rate_control_flags(hwenc, qp, bitrate, adaptive)
 
-    adaptive = getattr(host_args_manager.args, "adaptive", False)
-    dynamic_flags = _build_rate_control_flags(hwenc, qp, bitrate, adaptive)
-
     try:
         gop_val = int(gop)
         use_gop = gop_val > 0
@@ -2871,13 +2868,13 @@ def tcp_handshake_server(sock, encoder_str, _args):
                 conn.close()
                 continue
 
-            # Unknown command
+            # Unknown command - send FAIL response (best-effort, ignore if client disconnected)
             try:
                 conn.sendall(b"FAIL")
                 conn.shutdown(socket.SHUT_WR)
                 time.sleep(0.05)
-            except Exception:
-                pass
+            except OSError as e:
+                logging.debug(f"Failed to send FAIL response to {peer_ip}: {e}")
             conn.close()
 
         except OSError:
@@ -3317,6 +3314,8 @@ def _receive_heartbeat_pong(sock, client_heartbeat_addr, now):
                 client_heartbeat_addr = addr
                 logging.debug(f"Client heartbeat address updated to {addr}")
     except TimeoutError:
+        # Expected when no PONG received within 0.5s window - not an error condition.
+        # Actual timeout handling occurs in _check_heartbeat_timeout() after HEARTBEAT_TIMEOUT.
         pass
     except Exception as e:
         logging.debug("Heartbeat recv error: %s", e)

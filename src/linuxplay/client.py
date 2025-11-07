@@ -1754,10 +1754,6 @@ class GamepadThread(threading.Thread):
     def _find_device(self):
         if not HAVE_EVDEV:
             return None
-        try:
-            pass
-        except Exception:
-            return None
         if self.path_hint:
             try:
                 return InputDevice(self.path_hint)
