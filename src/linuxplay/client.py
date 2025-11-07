@@ -482,7 +482,7 @@ def _get_client_paths():
     )
 
 
-def _handle_challenge_response(sock, cert_path, key_path, ca_path, host_ip):  # noqa: PLR0911
+def _handle_challenge_response(sock, cert_path, key_path, ca_path, host_ip):
     """Handle challenge-response authentication with existing certificate.
 
     Returns: (success: bool, result: tuple | None)
@@ -553,7 +553,7 @@ def _handle_challenge_response(sock, cert_path, key_path, ca_path, host_ip):  # 
     return (None, "failed")
 
 
-def _handle_csr_submission(sock, key_path, cert_path, ca_path, host_ip, pin):  # noqa: PLR0911, PLR0913
+def _handle_csr_submission(sock, key_path, cert_path, ca_path, host_ip, pin):  # noqa: PLR0913
     """Handle CSR submission for first-time authentication.
 
     Returns: (success: bool, result: tuple | None)
@@ -2106,9 +2106,13 @@ class MainWindow(QMainWindow):
             logging.error(f"Control send error: {e}")
 
     def closeEvent(self, event):
-        """Clean up resources on window close.
+        r"""Clean up resources on window close.
 
-        python.exe .\client.py --host_ip 192.168.1.128 --decoder h.264 --hwaccel auto --pin <CURRENT_PIN>        python.exe .\client.py --host_ip 192.168.1.128 --decoder h.264 --hwaccel auto --audio disable        Critical pattern: Always use timeouts on thread joins to prevent hangs.
+        Example commands:
+            python.exe .\client.py --host_ip 192.168.1.128 --decoder h.264 --hwaccel auto --pin <CURRENT_PIN>
+            python.exe .\client.py --host_ip 192.168.1.128 --decoder h.264 --hwaccel auto --audio disable
+
+        Critical pattern: Always use timeouts on thread joins to prevent hangs.
         """
         self._running = False
         CLIENT_STATE["connected"] = False

@@ -100,6 +100,7 @@ select = [
 ]
 ignore = [
     "PLR0915", # too many statements
+    "PLR0911", # too many return statements
     "N802",    # function name should be lowercase (Qt conventions)
     "N803",    # argument name should be lowercase (Qt conventions)
     "N806",    # variable in function should be lowercase (Qt conventions)

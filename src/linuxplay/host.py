@@ -2600,7 +2600,7 @@ def _handle_csr_auth(conn, peer_ip, parts, encoder_str):
 
         # Activate session
         monitors_str = _activate_csr_session(peer_ip)
-        
+
         # Send final OK (only once!)
         conn.sendall(f"OK:{encoder_str}:{monitors_str}".encode())
         set_status(f"Client (new): {host_state.client_ip}")
