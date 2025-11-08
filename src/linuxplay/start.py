@@ -109,8 +109,11 @@ def ffmpeg_ok() -> bool:
 # FFmpeg capability caches with timestamps for TTL
 _FFENC_CACHE: dict[str, tuple[bool, float]] = {}  # {encoder: (available, timestamp)}
 _FFDEV_CACHE: dict[str, tuple[bool, float]] = {}  # {device: (available, timestamp)}
-# Cache for full encoder list to avoid repeated subprocess calls
-_FFMPEG_ENCODERS_CACHE: tuple[str, float] | None = None  # (encoder_list, timestamp)
+# Cache for full encoder/device lists to avoid repeated subprocess calls.
+# CodeQL false positive: These globals ARE used within their respective functions to cache expensive subprocess results.
+# The assignment on line 145/184 is consumed by the else branch on line 147/186, avoiding redundant FFmpeg invocations.
+_FFMPEG_ENCODERS_CACHE: tuple[str, float] | None = None  # (encoder_list_output, timestamp)
+_FFMPEG_DEVICES_CACHE: tuple[str, float] | None = None  # (device_list_output, timestamp)
 
 
 def ffmpeg_has_encoder(name: str) -> bool:
@@ -150,10 +153,6 @@ def ffmpeg_has_encoder(name: str) -> bool:
         logging.debug(f"Encoder check for '{name}' failed: {e}")
         _FFENC_CACHE[name] = (False, time.time())
         return False
-
-
-# Cache for full device list to avoid repeated subprocess calls
-_FFMPEG_DEVICES_CACHE: tuple[str, float] | None = None  # (device_list, timestamp)
 
 
 def ffmpeg_has_device(name: str) -> bool:
