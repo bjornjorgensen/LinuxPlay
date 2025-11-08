@@ -962,40 +962,40 @@ def get_intel_cpu_generation() -> int | None:
         _HW_CACHE[cache_key] = (None, time.time())
         return None
 
-        try:
-            if IS_LINUX and Path("/proc/cpuinfo").exists():
-                cpuinfo = Path("/proc/cpuinfo").read_text()
-                import re
+    try:
+        if IS_LINUX and Path("/proc/cpuinfo").exists():
+            cpuinfo = Path("/proc/cpuinfo").read_text()
+            import re
 
-                # Intel microarchitecture detection via CPU family/model
-                family_match = re.search(r"cpu family\s*:\s*(\d+)", cpuinfo)
-                model_match = re.search(r"^model\s*:\s*(\d+)", cpuinfo, re.MULTILINE)
+            # Intel microarchitecture detection via CPU family/model
+            family_match = re.search(r"cpu family\s*:\s*(\d+)", cpuinfo)
+            model_match = re.search(r"^model\s*:\s*(\d+)", cpuinfo, re.MULTILINE)
 
-                if family_match and model_match:
-                    family = int(family_match.group(1))
-                    model = int(model_match.group(1))
+            if family_match and model_match:
+                family = int(family_match.group(1))
+                model = int(model_match.group(1))
 
-                    if family == INTEL_FAMILY_CORE:
-                        # Simplified model-to-generation mapping
-                        # Full mapping: https://en.wikichip.org/wiki/intel/cpuid
-                        if model >= INTEL_MODEL_KABYLAKE:  # Kaby Lake+ (7th gen+)
-                            gen = INTEL_KABYLAKE_GEN
-                        elif model >= INTEL_MODEL_SKYLAKE:  # Skylake (6th gen)
-                            gen = INTEL_SKYLAKE_GEN
-                        elif model >= INTEL_MODEL_BROADWELL:  # Broadwell (5th gen)
-                            gen = INTEL_BROADWELL_GEN
-                        elif model >= INTEL_MODEL_HASWELL:  # Haswell (4th gen)
-                            gen = INTEL_HASWELL_GEN
-                        else:
-                            gen = None  # Older/unknown
+                if family == INTEL_FAMILY_CORE:
+                    # Simplified model-to-generation mapping
+                    # Full mapping: https://en.wikichip.org/wiki/intel/cpuid
+                    if model >= INTEL_MODEL_KABYLAKE:  # Kaby Lake+ (7th gen+)
+                        gen = INTEL_KABYLAKE_GEN
+                    elif model >= INTEL_MODEL_SKYLAKE:  # Skylake (6th gen)
+                        gen = INTEL_SKYLAKE_GEN
+                    elif model >= INTEL_MODEL_BROADWELL:  # Broadwell (5th gen)
+                        gen = INTEL_BROADWELL_GEN
+                    elif model >= INTEL_MODEL_HASWELL:  # Haswell (4th gen)
+                        gen = INTEL_HASWELL_GEN
+                    else:
+                        gen = None  # Older/unknown
 
-                        _HW_CACHE[cache_key] = (gen, time.time())
-                        logging.debug(f"Intel CPU generation detected: {gen} (family={family}, model={model})")
-                        return gen
-        except Exception as e:
-            logging.debug(f"Intel CPU generation detection failed: {e}")
+                    _HW_CACHE[cache_key] = (gen, time.time())
+                    logging.debug(f"Intel CPU generation detected: {gen} (family={family}, model={model})")
+                    return gen
+    except Exception as e:
+        logging.debug(f"Intel CPU generation detection failed: {e}")
 
-        _HW_CACHE[cache_key] = (None, time.time())
+    _HW_CACHE[cache_key] = (None, time.time())
 
     # Return cached value (guaranteed to exist after first call)
     return _HW_CACHE[cache_key][0]
