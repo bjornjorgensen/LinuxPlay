@@ -892,7 +892,7 @@ def has_nvidia() -> bool:
         if time.time() - cached_time < FFMPEG_CACHE_TTL_SECS:
             return cached_val
 
-    detected = False    # Method 1: pynvml (fastest, most reliable)
+    detected = False  # Method 1: pynvml (fastest, most reliable)
     if HAVE_PYNVML:
         try:
             pynvml.nvmlInit()
@@ -1095,6 +1095,8 @@ def ffmpeg_has_encoder(name: str) -> bool:
         logging.warning(f"Unexpected error checking encoder '{name}': {e}")
         _HW_CACHE[cache_key] = (False, time.time())
         return False
+
+
 def ffmpeg_has_demuxer(name: str) -> bool:
     """Check if FFmpeg has specific demuxer (with timeout)."""
     try:
@@ -1783,6 +1785,8 @@ def _parse_bitrate_bits(bstr: str) -> int:
         return result
     except (ValueError, IndexError):
         return 0
+
+
 def _format_bits(bits: int) -> str:
     """Format bitrate for human-readable display."""
     if bits >= BITS_PER_MEGABIT:
@@ -3846,13 +3850,17 @@ def _initialize_sockets(bind_address: str) -> bool:
 def _start_server_threads(args):
     """Start all server threads."""
     threading.Thread(
-        target=tcp_handshake_server, args=(host_state.handshake_sock, args.encoder, args),
-        daemon=True, name="HandshakeServer"
+        target=tcp_handshake_server,
+        args=(host_state.handshake_sock, args.encoder, args),
+        daemon=True,
+        name="HandshakeServer",
     ).start()
     threading.Thread(target=clipboard_monitor_host, daemon=True, name="ClipboardMonitor").start()
     threading.Thread(
-        target=clipboard_listener_host, args=(host_state.clipboard_listener_sock,),
-        daemon=True, name="ClipboardListener"
+        target=clipboard_listener_host,
+        args=(host_state.clipboard_listener_sock,),
+        daemon=True,
+        name="ClipboardListener",
     ).start()
     threading.Thread(target=file_upload_listener, daemon=True, name="FileUpload").start()
     threading.Thread(target=heartbeat_manager, args=(args,), daemon=True, name="Heartbeat").start()
