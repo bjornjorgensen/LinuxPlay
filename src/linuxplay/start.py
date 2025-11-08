@@ -7,10 +7,12 @@ import json
 import logging
 import os
 import platform as py_platform
+import re
 import shutil
 import subprocess
 import sys
 import threading
+import time
 import uuid
 from pathlib import Path
 
@@ -51,8 +53,10 @@ try:
 except (OSError, KeyError) as e:
     logging.debug("FFmpeg path setup failed: %s", e)
 
+# Platform detection (cached at module level for performance)
 IS_WINDOWS: bool = py_platform.system() == "Windows"
 IS_LINUX: bool = py_platform.system() == "Linux"
+IS_MACOS: bool = py_platform.system() == "Darwin"
 WG_INFO_PATH: Path = Path("/tmp/linuxplay_wg_info.json")
 CFG_PATH: Path = Path.home() / ".linuxplay_start_cfg.json"
 LINUXPLAY_MARKER: str = "LinuxPlayHost"
@@ -91,17 +95,26 @@ def ffmpeg_ok() -> bool:
             timeout=5,  # Prevent hanging on broken FFmpeg installations
         )
         return True
-    except (subprocess.CalledProcessError, FileNotFoundError, OSError, subprocess.TimeoutExpired) as e:
+    except FileNotFoundError:
+        logging.debug("FFmpeg not found in PATH")
+        return False
+    except subprocess.TimeoutExpired:
+        logging.warning("FFmpeg check timed out (5s) - may be unresponsive")
+        return False
+    except (subprocess.CalledProcessError, OSError) as e:
         logging.debug("FFmpeg check failed: %s", e)
         return False
 
 
-_FFENC_CACHE: dict[str, bool] = {}
-_FFDEV_CACHE: dict[str, bool] = {}
+# FFmpeg capability caches with timestamps for TTL
+_FFENC_CACHE: dict[str, tuple[bool, float]] = {}  # {encoder: (available, timestamp)}
+_FFDEV_CACHE: dict[str, tuple[bool, float]] = {}  # {device: (available, timestamp)}
+# Cache for full encoder list to avoid repeated subprocess calls
+_FFMPEG_ENCODERS_CACHE: tuple[str, float] | None = None  # (encoder_list, timestamp)
 
 
 def ffmpeg_has_encoder(name: str) -> bool:
-    """Check if ffmpeg has specified encoder (cached).
+    """Check if ffmpeg has specified encoder (cached with TTL).
 
     Args:
         name: Encoder name to check (e.g., 'h264_nvenc', 'libx264')
@@ -109,26 +122,42 @@ def ffmpeg_has_encoder(name: str) -> bool:
     Returns:
         True if encoder is available in FFmpeg build
     """
+    global _FFMPEG_ENCODERS_CACHE
     name = name.lower()
+    # Check cache with TTL
     if name in _FFENC_CACHE:
-        return _FFENC_CACHE[name]
+        available, timestamp = _FFENC_CACHE[name]
+        if time.time() - timestamp < FFMPEG_CACHE_TTL:
+            return available
+
+    # Fetch and cache full encoder list if not cached or expired
     try:
-        out = subprocess.check_output(
-            ["ffmpeg", "-hide_banner", "-encoders"],
-            stderr=subprocess.STDOUT,
-            universal_newlines=True,
-            timeout=5,
-        ).lower()
-        _FFENC_CACHE[name] = name in out
-        return _FFENC_CACHE[name]
+        if _FFMPEG_ENCODERS_CACHE is None or (time.time() - _FFMPEG_ENCODERS_CACHE[1] >= FFMPEG_CACHE_TTL):
+            out = subprocess.check_output(
+                ["ffmpeg", "-hide_banner", "-encoders"],
+                stderr=subprocess.STDOUT,
+                universal_newlines=True,
+                timeout=5,
+            ).lower()
+            _FFMPEG_ENCODERS_CACHE = (out, time.time())
+        else:
+            out = _FFMPEG_ENCODERS_CACHE[0]
+
+        result = name in out
+        _FFENC_CACHE[name] = (result, time.time())
+        return result
     except (subprocess.CalledProcessError, FileNotFoundError, OSError, subprocess.TimeoutExpired) as e:
         logging.debug(f"Encoder check for '{name}' failed: {e}")
-        _FFENC_CACHE[name] = False
+        _FFENC_CACHE[name] = (False, time.time())
         return False
 
 
+# Cache for full device list to avoid repeated subprocess calls
+_FFMPEG_DEVICES_CACHE: tuple[str, float] | None = None  # (device_list, timestamp)
+
+
 def ffmpeg_has_device(name: str) -> bool:
-    """Check if ffmpeg has specified input device (cached).
+    """Check if ffmpeg has specified input device (cached with TTL).
 
     Args:
         name: Device name to check (e.g., 'kmsgrab', 'x11grab')
@@ -136,16 +165,27 @@ def ffmpeg_has_device(name: str) -> bool:
     Returns:
         True if input device is available in FFmpeg build
     """
+    global _FFMPEG_DEVICES_CACHE
     name = name.lower()
+    # Check cache with TTL
     if name in _FFDEV_CACHE:
-        return _FFDEV_CACHE[name]
+        available, timestamp = _FFDEV_CACHE[name]
+        if time.time() - timestamp < FFMPEG_CACHE_TTL:
+            return available
+
+    # Fetch and cache full device list if not cached or expired
     try:
-        out = subprocess.check_output(
-            ["ffmpeg", "-hide_banner", "-devices"],
-            stderr=subprocess.STDOUT,
-            universal_newlines=True,
-            timeout=5,
-        ).lower()
+        if _FFMPEG_DEVICES_CACHE is None or (time.time() - _FFMPEG_DEVICES_CACHE[1] >= FFMPEG_CACHE_TTL):
+            out = subprocess.check_output(
+                ["ffmpeg", "-hide_banner", "-devices"],
+                stderr=subprocess.STDOUT,
+                universal_newlines=True,
+                timeout=5,
+            ).lower()
+            _FFMPEG_DEVICES_CACHE = (out, time.time())
+        else:
+            out = _FFMPEG_DEVICES_CACHE[0]
+
         found = False
         for line in out.splitlines():
             s = line.strip()
@@ -154,11 +194,11 @@ def ffmpeg_has_device(name: str) -> bool:
                 if len(parts) >= FFMPEG_OUTPUT_MIN_PARTS and parts[1] == name:
                     found = True
                     break
-        _FFDEV_CACHE[name] = found
+        _FFDEV_CACHE[name] = (found, time.time())
         return found
     except (subprocess.CalledProcessError, FileNotFoundError, OSError, subprocess.TimeoutExpired) as e:
         logging.debug(f"Device check for '{name}' failed: {e}")
-        _FFDEV_CACHE[name] = False
+        _FFDEV_CACHE[name] = (False, time.time())
         return False
 
 
@@ -220,7 +260,20 @@ def load_cfg() -> dict:
     try:
         with CFG_PATH.open(encoding="utf-8") as f:
             return json.load(f)
-    except (OSError, json.JSONDecodeError) as e:
+    except FileNotFoundError:
+        logging.debug(f"Config file not found: {CFG_PATH}")
+        return {}
+    except json.JSONDecodeError as e:
+        logging.warning(f"Corrupted config file {CFG_PATH}: {e}")
+        # Backup corrupted file and start fresh
+        try:
+            backup_path = CFG_PATH.with_suffix(".json.bak")
+            CFG_PATH.rename(backup_path)
+            logging.info(f"Backed up corrupted config to {backup_path}")
+        except OSError as backup_err:
+            logging.debug(f"Failed to backup corrupted config: {backup_err}")
+        return {}
+    except OSError as e:
         logging.debug(f"Failed to load config: {e}")
         return {}
 
@@ -318,12 +371,19 @@ def _ffmpeg_running_for_us(marker: str = LINUXPLAY_MARKER) -> bool:
     try:
         # Pre-define exceptions to avoid try-except overhead inside loop
         error_types = (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess)
-        for proc in psutil.process_iter(["name", "cmdline"], error_types):
-            proc_name = proc.info.get("name")
-            if proc_name and "ffmpeg" in proc_name.lower():
-                cmdline = proc.info.get("cmdline", [])
-                if cmdline and any(marker in arg for arg in cmdline):
-                    return True
+        for proc in psutil.process_iter(["name", "cmdline"]):
+            try:
+                info = proc.info
+                name = info.get("name", "")
+                # Quick name check first (cheaper than cmdline parsing)
+                if not name or name.lower() not in ("ffmpeg", "ffmpeg.exe"):
+                    continue
+
+                cmdline = info.get("cmdline")
+                if cmdline and any(marker in arg for arg in cmdline if isinstance(arg, str)):
+                    return True  # Early return on first match
+            except error_types:
+                continue
     except (RuntimeError, KeyError, TypeError) as e:
         logging.debug(f"FFmpeg process check failed: {e}")
     return False
@@ -552,7 +612,7 @@ class HostTab(QWidget):
         """Update WireGuard status display (Linux only).
 
         Checks WireGuard installation and tunnel status using native tools.
-        Priority: wg command → ip command fallback.
+        Fallback chain: wg command → ip link → kernel module check.
         """
         if not IS_LINUX:
             self.wgStatus.setText("WireGuard: not supported on this OS")
@@ -564,7 +624,7 @@ class HostTab(QWidget):
         installed = shutil.which("wg") is not None
 
         if installed:
-            # Primary method: wg command
+            # Primary method: wg command (userspace tools)
             try:
                 out = subprocess.check_output(
                     ["wg", "show"],
@@ -572,12 +632,14 @@ class HostTab(QWidget):
                     universal_newlines=True,
                     timeout=2,
                 )
-                active = "interface:" in out
-            except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as e:
-                # WireGuard command failed - fallback to ip command
+                active = "interface:" in out.lower()
+            except subprocess.TimeoutExpired:
+                logging.warning("WireGuard 'wg show' timed out (2s)")
+            except (subprocess.CalledProcessError, OSError) as e:
                 logging.debug(f"WireGuard 'wg' command failed: {e}")
-        else:
-            # Fallback: ip command (kernel-level check)
+
+        # Fallback: ip command (kernel-level check)
+        if not active and shutil.which("ip"):
             try:
                 out = subprocess.check_output(
                     ["ip", "-d", "link", "show", "type", "wireguard"],
@@ -586,9 +648,11 @@ class HostTab(QWidget):
                     timeout=2,
                 )
                 active = bool(out.strip())
-                installed = True
-            except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError, FileNotFoundError) as e:
-                # WireGuard detection failed - neither 'wg' nor 'ip' commands worked
+                if active:
+                    installed = True
+            except subprocess.TimeoutExpired:
+                logging.warning("WireGuard 'ip link' check timed out (2s)")
+            except (subprocess.CalledProcessError, OSError) as e:
                 logging.debug(f"WireGuard 'ip' command failed: {e}")
 
         # Update UI based on status
@@ -855,8 +919,18 @@ class HostTab(QWidget):
             return
 
         def _watch():
-            with contextlib.suppress(Exception):
-                _ = self.host_process.wait()
+            """Watch host process and cleanup on exit (prevents zombie processes)."""
+            try:
+                # Wait with timeout to prevent indefinite blocking
+                exit_code = self.host_process.wait(timeout=300)  # 5 min max
+                if exit_code != 0:
+                    logging.warning(f"Host process exited with code {exit_code}")
+            except subprocess.TimeoutExpired:
+                logging.error("Host process did not exit within 5 minutes")
+                with contextlib.suppress(OSError):
+                    self.host_process.kill()
+            except Exception as e:
+                logging.debug(f"Host process watch failed: {e}")
 
             def done():
                 self.host_process = None
@@ -1107,6 +1181,17 @@ class ClientTab(QWidget):
                 self,
                 "Missing Host IP",
                 "Please enter the host IP address or WireGuard tunnel IP.",
+            )
+            self.hostIPEdit.setFocus()
+            return
+
+        # Basic IP validation (IPv4 format check)
+        if not re.match(r"^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$", host_ip):
+            QMessageBox.warning(
+                self,
+                "Invalid Host IP",
+                f"'{host_ip}' does not appear to be a valid IPv4 address.\n\n"
+                "Expected format: xxx.xxx.xxx.xxx (e.g., 192.168.1.10)",
             )
             self.hostIPEdit.setFocus()
             return

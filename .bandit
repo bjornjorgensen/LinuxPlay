@@ -1,0 +1,24 @@
+# Bandit Security Configuration for LinuxPlay
+#
+# LinuxPlay uses subprocess extensively for system tools (FFmpeg, xdotool, etc.)
+# All subprocess calls use list arguments (NOT shell=True), preventing shell injection.
+# We suppress false positives while preserving real security checks.
+#
+# Usage: bandit -r src -ll -s B404,B603,B607,B110,B112
+#
+# Skipped checks (justified false positives):
+# - B404: import subprocess - Required for FFmpeg, xdotool, system probing
+# - B603: subprocess_without_shell_equals_true - Secure: hardcoded commands with list args
+# - B607: start_process_with_partial_path - Secure: system binaries (ffmpeg, pactl, xdotool)
+# - B110: try_except_pass - Documented non-critical errors (GPU fallbacks, cleanup)
+# - B112: try_except_continue - Documented retry logic (device enumeration)
+#
+# Remaining findings (acceptable):
+# - B104: hardcoded_bind_all_interfaces - False positive: checking 0.0.0.0 to REJECT it
+# - B108: hardcoded_tmp_directory - Acceptable: /tmp/linuxplay_wg_info.json is temp file
+#
+# Real security protections still active:
+# - Shell injection prevention (no shell=True usage)
+# - Path traversal protection (file uploads use pathlib validation)
+# - Network binding defaults to 127.0.0.1 (user must explicitly set --bind-address)
+# - Certificate-based authentication with RSA 4096-bit keys

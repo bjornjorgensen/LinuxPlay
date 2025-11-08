@@ -144,7 +144,7 @@ def _ensure_ca():
     if Path(CA_CERT).exists() and Path(CA_KEY).exists():
         return True
     try:
-        key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        key = rsa.generate_private_key(public_exponent=65537, key_size=4096)
         subject = issuer = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "LinuxPlay Host CA")])
         cert = (
             x509.CertificateBuilder()
@@ -278,7 +278,7 @@ def _issue_client_cert(
         else:
             # OLD LEGACY PATH: Server generates client keypair (INSECURE - deprecated)
             logging.warning("[AUTH] Generating client keypair on server (LEGACY MODE - INSECURE)")
-            key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+            key = rsa.generate_private_key(public_exponent=65537, key_size=4096)
             subject = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, client_name)])
             cert = (
                 x509.CertificateBuilder()
@@ -851,12 +851,24 @@ def pin_manager_thread():
 
 
 # Cache for hardware detection to avoid repeated expensive calls
-_HW_CACHE = {}
+_HW_CACHE = {}  # Format: {key: (value, timestamp)} for TTL support
+# Cache for bitrate parsing to avoid repeated string conversions
+_BITRATE_CACHE = {}
+# Maximum cache size to prevent unbounded memory growth
+MAX_BITRATE_CACHE_SIZE = 100
+# Cache TTL (5 minutes) - allows hot-swap of GPU drivers without restart
+FFMPEG_CACHE_TTL_SECS = 300
+# CPU detection cache TTL (1 hour) - CPU doesn't hot-swap
+CPU_CACHE_TTL_SECS = 3600
+# Cache for ffmpeg encoder detection to avoid repeated subprocess calls
+_FFMPEG_ENCODER_CACHE = {}
+_FFMPEG_ENCODER_CACHE_TTL = 300  # 5 minutes TTL
 
 
 def _clear_hw_cache():
     """Clear hardware detection cache. Used in tests and when hardware changes."""
     _HW_CACHE.clear()
+    _BITRATE_CACHE.clear()
 
 
 def has_nvidia() -> bool:
@@ -868,44 +880,60 @@ def has_nvidia() -> bool:
 
     Returns:
         bool: True if NVIDIA GPU detected and accessible
+
+    Note:
+        Uses TTL-based caching to support GPU driver updates without restart.
     """
-    if "nvidia" not in _HW_CACHE:
-        detected = False
+    cache_key = "nvidia"
 
-        # Method 1: pynvml (fastest, most reliable)
-        if HAVE_PYNVML:
-            try:
-                pynvml.nvmlInit()
-                count = pynvml.nvmlDeviceGetCount()
-                pynvml.nvmlShutdown()
-                detected = count > 0
-                if detected:
-                    logging.debug(f"NVIDIA GPU detected via pynvml: {count} device(s)")
-            except Exception as e:
-                logging.debug(f"pynvml detection failed: {e}")
+    # Check TTL-based cache
+    if cache_key in _HW_CACHE:
+        cached_val, cached_time = _HW_CACHE[cache_key]
+        if time.time() - cached_time < FFMPEG_CACHE_TTL_SECS:
+            return cached_val
 
-        # Method 2: nvidia-smi (fallback)
-        if not detected:
-            detected = which("nvidia-smi") is not None
+    detected = False    # Method 1: pynvml (fastest, most reliable)
+    if HAVE_PYNVML:
+        try:
+            pynvml.nvmlInit()
+            count = pynvml.nvmlDeviceGetCount()
+            pynvml.nvmlShutdown()
+            detected = count > 0
             if detected:
-                logging.debug("NVIDIA GPU detected via nvidia-smi")
+                logging.debug(f"NVIDIA GPU detected via pynvml: {count} device(s)")
+        except Exception as e:
+            logging.debug(f"pynvml detection failed: {e}")
 
-        _HW_CACHE["nvidia"] = detected
-    return _HW_CACHE["nvidia"]
+    # Method 2: nvidia-smi (fallback) - only check if pynvml failed
+    if not detected:
+        detected = which("nvidia-smi") is not None
+        if detected:
+            logging.debug("NVIDIA GPU detected via nvidia-smi")
+
+    _HW_CACHE[cache_key] = (detected, time.time())
+    return detected
 
 
 def is_intel_cpu():
     """Check if CPU is Intel."""
-    if "intel_cpu" not in _HW_CACHE:
-        try:
-            if IS_LINUX:
-                _HW_CACHE["intel_cpu"] = "GenuineIntel" in Path("/proc/cpuinfo").read_text()
-            else:
-                p = (py_platform.processor() or "").lower()
-                _HW_CACHE["intel_cpu"] = "intel" in p or "intel" in py_platform.platform().lower()
-        except Exception:
-            _HW_CACHE["intel_cpu"] = False
-    return _HW_CACHE["intel_cpu"]
+    cache_key = "intel_cpu"
+    if cache_key in _HW_CACHE:
+        cached_val, cached_time = _HW_CACHE[cache_key]
+        # CPU detection can use longer TTL (doesn't change at runtime)
+        if time.time() - cached_time < CPU_CACHE_TTL_SECS:
+            return cached_val
+
+    try:
+        if IS_LINUX:
+            result = "GenuineIntel" in Path("/proc/cpuinfo").read_text()
+        else:
+            p = (py_platform.processor() or "").lower()
+            result = "intel" in p or "intel" in py_platform.platform().lower()
+        _HW_CACHE[cache_key] = (result, time.time())
+        return result
+    except Exception:
+        _HW_CACHE[cache_key] = (False, time.time())
+        return False
 
 
 def get_intel_cpu_generation() -> int | None:
@@ -923,10 +951,16 @@ def get_intel_cpu_generation() -> int | None:
         - 6: Skylake (full QSV with low-latency modes) ✅
         - 7+: Kaby Lake and newer (recommended) ✅
     """
-    if "intel_generation" not in _HW_CACHE:
-        if not is_intel_cpu():
-            _HW_CACHE["intel_generation"] = None
-            return None
+    cache_key = "intel_generation"
+    if cache_key in _HW_CACHE:
+        cached_val, cached_time = _HW_CACHE[cache_key]
+        # CPU generation doesn't change at runtime - use long TTL
+        if time.time() - cached_time < CPU_CACHE_TTL_SECS:
+            return cached_val
+
+    if not is_intel_cpu():
+        _HW_CACHE[cache_key] = (None, time.time())
+        return None
 
         try:
             if IS_LINUX and Path("/proc/cpuinfo").exists():
@@ -955,15 +989,16 @@ def get_intel_cpu_generation() -> int | None:
                         else:
                             gen = None  # Older/unknown
 
-                        _HW_CACHE["intel_generation"] = gen
+                        _HW_CACHE[cache_key] = (gen, time.time())
                         logging.debug(f"Intel CPU generation detected: {gen} (family={family}, model={model})")
                         return gen
         except Exception as e:
             logging.debug(f"Intel CPU generation detection failed: {e}")
 
-        _HW_CACHE["intel_generation"] = None
+        _HW_CACHE[cache_key] = (None, time.time())
 
-    return _HW_CACHE["intel_generation"]
+    # Return cached value (guaranteed to exist after first call)
+    return _HW_CACHE[cache_key][0]
 
 
 def has_vaapi():
@@ -974,64 +1009,92 @@ def has_vaapi():
     2. /dev/dri/renderD128 exists (Intel/AMD GPU render node)
     3. (Optionally) User has permission to access device
     """
-    if "vaapi" not in _HW_CACHE:
-        if not IS_LINUX:
-            _HW_CACHE["vaapi"] = False
-            return False
+    cache_key = "vaapi"
 
-        device_path = Path("/dev/dri/renderD128")
-        if not device_path.exists():
-            _HW_CACHE["vaapi"] = False
-            return False
+    # Check TTL-based cache
+    if cache_key in _HW_CACHE:
+        cached_val, cached_time = _HW_CACHE[cache_key]
+        if time.time() - cached_time < FFMPEG_CACHE_TTL_SECS:
+            return cached_val
 
-        # Check if we can actually access the device
-        try:
-            # Try to open device (read-only check)
-            with device_path.open("rb"):
-                # Just check permissions, don't read
-                pass
-            _HW_CACHE["vaapi"] = True
-        except PermissionError:
-            # Device exists but not accessible (not in video group)
-            logging.warning(
-                "VAAPI device /dev/dri/renderD128 exists but not accessible. "
-                "Add user to 'video' group: sudo usermod -aG video $USER"
-            )
-            _HW_CACHE["vaapi"] = False
-        except Exception as e:
-            logging.debug(f"VAAPI device check failed: {e}")
-            _HW_CACHE["vaapi"] = False
+    if not IS_LINUX:
+        _HW_CACHE[cache_key] = (False, time.time())
+        return False
 
-    return _HW_CACHE["vaapi"]
+    device_path = Path("/dev/dri/renderD128")
+    if not device_path.exists():
+        _HW_CACHE[cache_key] = (False, time.time())
+        return False
+
+    # Check if we can actually access the device
+    try:
+        # Try to open device (read-only check)
+        with device_path.open("rb"):
+            # Just check permissions, don't read
+            pass
+        _HW_CACHE[cache_key] = (True, time.time())
+        return True
+    except PermissionError:
+        # Device exists but not accessible (not in video group)
+        logging.warning(
+            "VAAPI device /dev/dri/renderD128 exists but not accessible. "
+            "Add user to 'video' group: sudo usermod -aG video $USER"
+        )
+        _HW_CACHE[cache_key] = (False, time.time())
+        return False
+    except Exception as e:
+        logging.debug(f"VAAPI device check failed: {e}")
+        _HW_CACHE[cache_key] = (False, time.time())
+        return False
 
 
 def ffmpeg_has_encoder(name: str) -> bool:
-    """Check if FFmpeg has specific encoder (with timeout and better error handling)."""
+    """Check if FFmpeg has specific encoder (with timeout and better error handling).
+
+    Args:
+        name: Encoder name (e.g., 'h264_nvenc', 'libx264')
+
+    Returns:
+        True if encoder is available
+
+    Note:
+        Uses TTL-based caching (5min) to allow driver hot-swap without restart.
+    """
     cache_key = f"encoder_{name}"
-    if cache_key not in _HW_CACHE:
-        try:
-            out = subprocess.check_output(
-                ["ffmpeg", "-hide_banner", "-encoders"],
-                stderr=subprocess.DEVNULL,
-                universal_newlines=True,
-                timeout=5,
-            ).lower()
-            _HW_CACHE[cache_key] = name.lower() in out
-        except subprocess.TimeoutExpired:
-            logging.warning(f"FFmpeg encoder check timed out for '{name}'")
-            _HW_CACHE[cache_key] = False
-        except FileNotFoundError:
-            logging.error("FFmpeg not found in PATH")
-            _HW_CACHE[cache_key] = False
-        except subprocess.CalledProcessError as e:
-            logging.debug(f"FFmpeg encoder check failed for '{name}': exit code {e.returncode}")
-            _HW_CACHE[cache_key] = False
-        except Exception as e:
-            logging.warning(f"Unexpected error checking encoder '{name}': {e}")
-            _HW_CACHE[cache_key] = False
-    return _HW_CACHE[cache_key]
 
+    # Check TTL-based cache
+    if cache_key in _HW_CACHE:
+        cached_val, cached_time = _HW_CACHE[cache_key]
+        if time.time() - cached_time < FFMPEG_CACHE_TTL_SECS:
+            return cached_val
 
+    # Cache miss or expired - probe ffmpeg
+    try:
+        out = subprocess.check_output(
+            ["ffmpeg", "-hide_banner", "-encoders"],
+            stderr=subprocess.DEVNULL,
+            universal_newlines=True,
+            timeout=5,
+        ).lower()
+        result = name.lower() in out
+        _HW_CACHE[cache_key] = (result, time.time())
+        return result
+    except subprocess.TimeoutExpired:
+        logging.warning(f"FFmpeg encoder check timed out for '{name}'")
+        _HW_CACHE[cache_key] = (False, time.time())
+        return False
+    except FileNotFoundError:
+        logging.error("FFmpeg not found in PATH")
+        _HW_CACHE[cache_key] = (False, time.time())
+        return False
+    except subprocess.CalledProcessError as e:
+        logging.debug(f"FFmpeg encoder check failed for '{name}': exit code {e.returncode}")
+        _HW_CACHE[cache_key] = (False, time.time())
+        return False
+    except Exception as e:
+        logging.warning(f"Unexpected error checking encoder '{name}': {e}")
+        _HW_CACHE[cache_key] = (False, time.time())
+        return False
 def ffmpeg_has_demuxer(name: str) -> bool:
     """Check if FFmpeg has specific demuxer (with timeout)."""
     try:
@@ -1107,25 +1170,35 @@ def ffmpeg_hwaccels() -> set:
     - Missing i915 kernel driver
     - Incorrect /dev/dri/renderD128 permissions
     """
-    if "hwaccels" not in _HW_CACHE:
-        try:
-            out = subprocess.check_output(
-                ["ffmpeg", "-hide_banner", "-hwaccels"], stderr=subprocess.STDOUT, universal_newlines=True, timeout=5
-            )
-            hwaccels = set()
-            for raw_line in out.splitlines():
-                line = raw_line.strip().lower()
-                if line and not line.startswith("hardware"):
-                    hwaccels.add(line)
-            _HW_CACHE["hwaccels"] = hwaccels
-            logging.debug(f"Detected hardware accelerators: {hwaccels}")
-        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError) as e:
-            logging.debug(f"Hardware accelerator detection failed: {e}")
-            _HW_CACHE["hwaccels"] = set()
-        except Exception as e:
-            logging.warning(f"Unexpected error detecting hwaccels: {e}")
-            _HW_CACHE["hwaccels"] = set()
-    return _HW_CACHE["hwaccels"]
+    cache_key = "hwaccels"
+
+    # Check TTL-based cache
+    if cache_key in _HW_CACHE:
+        cached_val, cached_time = _HW_CACHE[cache_key]
+        if time.time() - cached_time < FFMPEG_CACHE_TTL_SECS:
+            return cached_val
+
+    # Cache miss or expired - probe ffmpeg
+    try:
+        out = subprocess.check_output(
+            ["ffmpeg", "-hide_banner", "-hwaccels"], stderr=subprocess.STDOUT, universal_newlines=True, timeout=5
+        )
+        hwaccels = set()
+        for raw_line in out.splitlines():
+            line = raw_line.strip().lower()
+            if line and not line.startswith("hardware"):
+                hwaccels.add(line)
+        _HW_CACHE[cache_key] = (hwaccels, time.time())
+        logging.debug(f"Detected hardware accelerators: {hwaccels}")
+        return hwaccels
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError) as e:
+        logging.debug(f"Hardware accelerator detection failed: {e}")
+        _HW_CACHE[cache_key] = (set(), time.time())
+        return set()
+    except Exception as e:
+        logging.warning(f"Unexpected error detecting hwaccels: {e}")
+        _HW_CACHE[cache_key] = (set(), time.time())
+        return set()
 
 
 def test_qsv_encode() -> bool:
@@ -1678,8 +1751,18 @@ def _best_ts_pkt_size(mtu_guess: int, ipv6: bool) -> int:
 
 
 def _parse_bitrate_bits(bstr: str) -> int:
+    """Parse bitrate string to bits per second with caching.
+
+    Performance optimization: Cache results to avoid repeated string parsing
+    in hot paths (bitrate adjustments, metric logging).
+    """
     if not bstr:
         return 0
+
+    # Check cache first (avoids expensive string operations)
+    if bstr in _BITRATE_CACHE:
+        return _BITRATE_CACHE[bstr]
+
     s = str(bstr).strip().lower()
     if not s:
         return 0
@@ -1692,13 +1775,14 @@ def _parse_bitrate_bits(bstr: str) -> int:
             "g": BITS_PER_GIGABIT,
         }.get(last_char)
 
-        if multiplier:
-            return int(float(s[:-1]) * multiplier)
-        return int(float(s))
+        result = int(float(s[:-1]) * multiplier) if multiplier else int(float(s))
+
+        # Cache result (limit cache size to prevent unbounded growth)
+        if len(_BITRATE_CACHE) < MAX_BITRATE_CACHE_SIZE:
+            _BITRATE_CACHE[bstr] = result
+        return result
     except (ValueError, IndexError):
         return 0
-
-
 def _format_bits(bits: int) -> str:
     """Format bitrate for human-readable display."""
     if bits >= BITS_PER_MEGABIT:
@@ -2230,18 +2314,47 @@ def _detect_audio_channels(mon):
     if not which("pactl"):
         return 2
 
+    max_lines_after_source = 2  # Search window after finding target source
+
     try:
-        probe = subprocess.check_output(
-            [
-                "bash",
-                "-c",
-                f"pactl list sources | grep -A2 '{mon}' | grep 'Channels' | head -n1 | awk '{{print $2}}'",
-            ],
+        # Shell injection prevention: Parse pactl output in Python instead of shell pipeline
+        pactl_output = subprocess.check_output(
+            ["pactl", "list", "sources"],
             text=True,
-        ).strip()
-        if probe.isdigit():
-            channels = int(probe)
-            return channels if channels in [1, 2, 6, 8] else 2
+            stderr=subprocess.DEVNULL,
+            timeout=5,
+        )
+
+        # Parse output to find the monitor source and extract channel count
+        lines = pactl_output.splitlines()
+        in_target_source = False
+        lines_after_source = 0
+
+        for line in lines:
+            # Check if this is the target source
+            if mon in line:
+                in_target_source = True
+                lines_after_source = 0
+                continue
+
+            # Look for Channels line within search window after finding the source
+            if in_target_source:
+                lines_after_source += 1
+                if "Channels:" in line or "channels:" in line.lower():
+                    # Extract channel count (format: "Channels: 2" or similar)
+                    parts = line.split()
+                    for i, part in enumerate(parts):
+                        if part.lower() in ("channels:", "channels") and i + 1 < len(parts) and parts[i + 1].isdigit():
+                            channels = int(parts[i + 1])
+                            return channels if channels in [1, 2, 6, 8] else 2
+                    break
+
+                # Stop searching after max lines
+                if lines_after_source > max_lines_after_source:
+                    in_target_source = False
+
+    except subprocess.TimeoutExpired:
+        logging.warning("pactl list sources timed out")
     except Exception as e:
         logging.warning("Audio channel detection failed: %s", e)
 
@@ -3680,13 +3793,13 @@ class GamepadServer(threading.Thread):
 def session_manager(args):
     while not host_state.should_terminate:
         if time.time() - host_state.last_disconnect_ts < RECONNECT_COOLDOWN:
-            time.sleep(0.5)
+            time.sleep(0.1)
             continue
 
         if host_state.client_ip and not host_state.video_threads:
             set_status(f"Client: {host_state.client_ip}")
             start_streams_for_current_client(args)
-        time.sleep(0.5)
+        time.sleep(0.1)
 
 
 def _signal_handler(signum, _frame):
@@ -3697,31 +3810,34 @@ def _signal_handler(signum, _frame):
         sys.exit(0)
 
 
-def _initialize_sockets(bind_address):
+def _initialize_sockets(bind_address: str) -> bool:
     """Initialize all server sockets. Returns True on success, False on error."""
     try:
         host_state.handshake_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         host_state.handshake_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         host_state.handshake_sock.bind((bind_address, TCP_HANDSHAKE_PORT))
         host_state.handshake_sock.listen(5)
-    except Exception as e:
-        trigger_shutdown(f"Handshake socket error: {e}")
+        logging.debug(f"Handshake socket bound to {bind_address}:{TCP_HANDSHAKE_PORT}")
+    except OSError as e:
+        trigger_shutdown(f"Handshake socket error on {bind_address}:{TCP_HANDSHAKE_PORT}: {e}")
         return False
 
     try:
         host_state.control_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         host_state.control_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         host_state.control_sock.bind((bind_address, UDP_CONTROL_PORT))
-    except Exception as e:
-        trigger_shutdown(f"Control socket error: {e}")
+        logging.debug(f"Control socket bound to {bind_address}:{UDP_CONTROL_PORT}")
+    except OSError as e:
+        trigger_shutdown(f"Control socket error on {bind_address}:{UDP_CONTROL_PORT}: {e}")
         return False
 
     try:
         host_state.clipboard_listener_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         host_state.clipboard_listener_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         host_state.clipboard_listener_sock.bind((bind_address, UDP_CLIPBOARD_PORT))
-    except Exception as e:
-        trigger_shutdown(f"Clipboard socket error: {e}")
+        logging.debug(f"Clipboard socket bound to {bind_address}:{UDP_CLIPBOARD_PORT}")
+    except OSError as e:
+        trigger_shutdown(f"Clipboard socket error on {bind_address}:{UDP_CLIPBOARD_PORT}: {e}")
         return False
 
     return True
@@ -3730,22 +3846,29 @@ def _initialize_sockets(bind_address):
 def _start_server_threads(args):
     """Start all server threads."""
     threading.Thread(
-        target=tcp_handshake_server, args=(host_state.handshake_sock, args.encoder, args), daemon=True
+        target=tcp_handshake_server, args=(host_state.handshake_sock, args.encoder, args),
+        daemon=True, name="HandshakeServer"
     ).start()
-    threading.Thread(target=clipboard_monitor_host, daemon=True).start()
-    threading.Thread(target=clipboard_listener_host, args=(host_state.clipboard_listener_sock,), daemon=True).start()
-    threading.Thread(target=file_upload_listener, daemon=True).start()
-    threading.Thread(target=heartbeat_manager, args=(args,), daemon=True).start()
-    threading.Thread(target=session_manager, args=(args,), daemon=True).start()
-    threading.Thread(target=control_listener, args=(host_state.control_sock,), daemon=True).start()
-    threading.Thread(target=resource_monitor, daemon=True).start()
-    threading.Thread(target=stats_broadcast, daemon=True).start()
-    threading.Thread(target=pin_manager_thread, daemon=True).start()
+    threading.Thread(target=clipboard_monitor_host, daemon=True, name="ClipboardMonitor").start()
+    threading.Thread(
+        target=clipboard_listener_host, args=(host_state.clipboard_listener_sock,),
+        daemon=True, name="ClipboardListener"
+    ).start()
+    threading.Thread(target=file_upload_listener, daemon=True, name="FileUpload").start()
+    threading.Thread(target=heartbeat_manager, args=(args,), daemon=True, name="Heartbeat").start()
+    threading.Thread(target=session_manager, args=(args,), daemon=True, name="SessionManager").start()
+    threading.Thread(
+        target=control_listener, args=(host_state.control_sock,), daemon=True, name="ControlListener"
+    ).start()
+    threading.Thread(target=resource_monitor, daemon=True, name="ResourceMonitor").start()
+    threading.Thread(target=stats_broadcast, daemon=True, name="StatsBroadcast").start()
+    threading.Thread(target=pin_manager_thread, daemon=True, name="PINManager").start()
 
     if IS_LINUX:
         try:
             host_state.gamepad_thread = GamepadServer()
             host_state.gamepad_thread.start()
+            logging.debug("Gamepad server thread started")
         except Exception as e:
             logging.error("Failed to start gamepad server: %s", e)
 
@@ -3755,7 +3878,7 @@ def core_main(args, use_signals=True) -> int:
         try:
             for _sig in (signal.SIGINT, signal.SIGTERM):
                 signal.signal(_sig, _signal_handler)
-        except Exception as e:
+        except (ValueError, OSError) as e:
             # Signal registration failed - may be in non-main thread or unsupported platform
             logging.debug(f"Signal handler registration failed: {e}")
 
@@ -3764,6 +3887,18 @@ def core_main(args, use_signals=True) -> int:
     host_state.current_bitrate = args.bitrate
     host_state.monitors = detect_monitors() or [(1920, 1080, 0, 0)]
     host_args_manager.args = args
+
+    # Security warning for non-localhost binding
+    if args.bind_address not in ("127.0.0.1", "localhost"):
+        if args.bind_address == "0.0.0.0":
+            logging.warning(
+                "⚠️  SECURITY WARNING: Binding to 0.0.0.0 exposes ALL network interfaces. "
+                "Use a specific IP address (e.g., 192.168.1.100) for LAN or WireGuard tunnel IP for WAN."
+            )
+        else:
+            logging.info(
+                "Binding to %s - ensure firewall rules are configured and network is trusted.", args.bind_address
+            )
 
     if not _initialize_sockets(args.bind_address):
         stop_all()
@@ -3777,7 +3912,7 @@ def core_main(args, use_signals=True) -> int:
     exit_code = 0
     try:
         while not host_state.should_terminate:
-            time.sleep(0.2)
+            time.sleep(0.1)
     except KeyboardInterrupt:
         trigger_shutdown("KeyboardInterrupt")
     finally:

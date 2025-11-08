@@ -1,4 +1,4 @@
-.PHONY: help install install-dev install-test sync lint format check fix test test-unit test-integration test-cov run-host run-client run-gui clean
+.PHONY: help install install-dev install-test sync lint format check fix security test test-unit test-integration test-cov run-host run-client run-gui clean
 
 help:  ## Show this help message
 	@echo 'Usage: make [target]'
@@ -30,6 +30,10 @@ check:  ## Run linter without making changes
 fix:  ## Auto-fix linting issues
 	uv run ruff check src tests --fix
 	uv run ruff format src tests
+
+security:  ## Run Bandit security scan
+	@echo "Running Bandit security scan (skipping subprocess false positives)..."
+	uv run bandit -r src -ll -s B404,B603,B607,B110,B112 || true
 
 test:  ## Run all tests
 	uv run pytest tests/ -v

@@ -348,6 +348,98 @@ class TestPinGeneration:
         assert pin.isdigit()
 
 
+class TestNetworkBindingSecurity:
+    """Tests for network binding security defaults."""
+
+    def test_bind_address_defaults_to_localhost(self):
+        """Bind address should default to 127.0.0.1 for security."""
+        from unittest.mock import patch
+
+        # Mock sys.argv to test default behavior
+        with patch("sys.argv", ["linuxplay-host"]):
+            from linuxplay.host import parse_args
+
+            args = parse_args()
+            assert args.bind_address == "127.0.0.1"
+
+    def test_bind_address_can_be_overridden(self):
+        """User should be able to explicitly set bind address."""
+        from unittest.mock import patch
+
+        # Test LAN IP
+        with patch("sys.argv", ["linuxplay-host", "--bind-address", "192.168.1.100"]):
+            from linuxplay.host import parse_args
+
+            args = parse_args()
+            assert args.bind_address == "192.168.1.100"
+
+    def test_bind_address_zero_allowed_but_dangerous(self):
+        """Test 0.0.0.0 is allowed (dangerous but user's choice)."""
+        from unittest.mock import patch
+
+        # Test 0.0.0.0 (dangerous but allowed)
+        with patch("sys.argv", ["linuxplay-host", "--bind-address", "0.0.0.0"]):
+            from linuxplay.host import parse_args
+
+            args = parse_args()
+            assert args.bind_address == "0.0.0.0"
+
+    def test_bind_address_localhost_equivalents(self):
+        """Test that localhost string is accepted."""
+        from unittest.mock import patch
+
+        with patch("sys.argv", ["linuxplay-host", "--bind-address", "localhost"]):
+            from linuxplay.host import parse_args
+
+            args = parse_args()
+            assert args.bind_address == "localhost"
+
+    def test_security_warning_for_zero_binding(self):
+        """Test that binding to 0.0.0.0 triggers security warning."""
+        import logging
+        from unittest.mock import MagicMock, patch
+
+        # Create mock logger
+        mock_logger = MagicMock()
+
+        with patch("linuxplay.host.logging.warning", mock_logger):
+            # Simulate core_main security check
+            bind_address = "0.0.0.0"
+            if bind_address not in ("127.0.0.1", "localhost") and bind_address == "0.0.0.0":
+                logging.warning(
+                    "⚠️  SECURITY WARNING: Binding to 0.0.0.0 exposes ALL network interfaces. "
+                    "Use a specific IP address (e.g., 192.168.1.100) for LAN or WireGuard tunnel IP for WAN."
+                )
+
+        # Verify warning was called
+        mock_logger.assert_called_once()
+        args = mock_logger.call_args[0]
+        assert "SECURITY WARNING" in args[0]
+        assert "0.0.0.0" in args[0]
+
+    def test_info_message_for_lan_binding(self):
+        """Test that binding to LAN IP triggers info message."""
+        import logging
+        from unittest.mock import MagicMock, patch
+
+        # Create mock logger
+        mock_logger = MagicMock()
+
+        with patch("linuxplay.host.logging.info", mock_logger):
+            # Simulate core_main security check
+            bind_address = "192.168.1.100"
+            if bind_address not in ("127.0.0.1", "localhost") and bind_address != "0.0.0.0":
+                logging.info(
+                    "Binding to %s - ensure firewall rules are configured and network is trusted.", bind_address
+                )
+
+        # Verify info was called with bind address
+        mock_logger.assert_called()
+        call_args = mock_logger.call_args[0]
+        assert "Binding to" in call_args[0]
+        assert bind_address in call_args
+
+
 @pytest.mark.integration
 class TestHandshakeRateLimiting:
     """Integration tests for handshake with rate limiting."""

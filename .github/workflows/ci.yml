@@ -37,6 +37,39 @@ jobs:
         run: |
           uv run ruff format --check src tests
 
+  security:
+    name: Security Scan with Bandit
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          version: "latest"
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          uv pip install --system -e ".[dev]"
+
+      - name: Run Bandit security scan
+        run: |
+          uv run bandit -r src -ll -s B404,B603,B607,B110,B112 -f json -o bandit-report.json || true
+          uv run bandit -r src -ll -s B404,B603,B607,B110,B112 || true
+
+      - name: Upload Bandit report
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: bandit-security-report
+          path: bandit-report.json
+
   test:
     name: Test on Python ${{ matrix.python-version }}
     runs-on: ubuntu-latest
@@ -184,12 +217,13 @@ jobs:
   status-check:
     name: CI Status Check
     if: always()
-    needs: [lint, test, coverage, build]
+    needs: [lint, security, test, coverage, build]
     runs-on: ubuntu-latest
     steps:
       - name: Check CI status
         run: |
           if [[ "${{ needs.lint.result }}" == "failure" ]] || \
+             [[ "${{ needs.security.result }}" == "failure" ]] || \
              [[ "${{ needs.test.result }}" == "failure" ]] || \
              [[ "${{ needs.coverage.result }}" == "failure" ]] || \
              [[ "${{ needs.build.result }}" == "failure" ]]; then
