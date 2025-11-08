@@ -110,8 +110,6 @@ def ffmpeg_ok() -> bool:
 _FFENC_CACHE: dict[str, tuple[bool, float]] = {}  # {encoder: (available, timestamp)}
 _FFDEV_CACHE: dict[str, tuple[bool, float]] = {}  # {device: (available, timestamp)}
 # Cache for full encoder/device lists to avoid repeated subprocess calls.
-# CodeQL false positive: These globals ARE used within their respective functions to cache expensive subprocess results.
-# The assignment on line 145/184 is consumed by the else branch on line 147/186, avoiding redundant FFmpeg invocations.
 _FFMPEG_ENCODERS_CACHE: tuple[str, float] | None = None  # (encoder_list_output, timestamp)
 _FFMPEG_DEVICES_CACHE: tuple[str, float] | None = None  # (device_list_output, timestamp)
 
@@ -135,6 +133,7 @@ def ffmpeg_has_encoder(name: str) -> bool:
 
     # Fetch and cache full encoder list if not cached or expired
     try:
+        # Check if cache needs refresh
         if _FFMPEG_ENCODERS_CACHE is None or (time.time() - _FFMPEG_ENCODERS_CACHE[1] >= FFMPEG_CACHE_TTL):
             out = subprocess.check_output(
                 ["ffmpeg", "-hide_banner", "-encoders"],
@@ -143,10 +142,13 @@ def ffmpeg_has_encoder(name: str) -> bool:
                 timeout=5,
             ).lower()
             _FFMPEG_ENCODERS_CACHE = (out, time.time())
+            # Use freshly fetched output
+            encoder_list = out
         else:
-            out = _FFMPEG_ENCODERS_CACHE[0]
+            # Use cached output
+            encoder_list = _FFMPEG_ENCODERS_CACHE[0]
 
-        result = name in out
+        result = name in encoder_list
         _FFENC_CACHE[name] = (result, time.time())
         return result
     except (subprocess.CalledProcessError, FileNotFoundError, OSError, subprocess.TimeoutExpired) as e:
@@ -174,6 +176,7 @@ def ffmpeg_has_device(name: str) -> bool:
 
     # Fetch and cache full device list if not cached or expired
     try:
+        # Check if cache needs refresh
         if _FFMPEG_DEVICES_CACHE is None or (time.time() - _FFMPEG_DEVICES_CACHE[1] >= FFMPEG_CACHE_TTL):
             out = subprocess.check_output(
                 ["ffmpeg", "-hide_banner", "-devices"],
@@ -182,11 +185,14 @@ def ffmpeg_has_device(name: str) -> bool:
                 timeout=5,
             ).lower()
             _FFMPEG_DEVICES_CACHE = (out, time.time())
+            # Use freshly fetched output
+            device_list = out
         else:
-            out = _FFMPEG_DEVICES_CACHE[0]
+            # Use cached output
+            device_list = _FFMPEG_DEVICES_CACHE[0]
 
         found = False
-        for line in out.splitlines():
+        for line in device_list.splitlines():
             s = line.strip()
             if s.startswith(("d ", " d ")):
                 parts = s.split()
