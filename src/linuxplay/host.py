@@ -1727,6 +1727,8 @@ def _detect_monitors_wayland():  # noqa: PLR0912 - Complex detection logic for m
                             current_output["width"] = int(w)
                             current_output["height"] = int(h)
                     except (ValueError, IndexError):
+                        # Skip malformed resolution lines (e.g., missing dimensions or non-numeric values)
+                        # This is expected when parsing varied wlr-randr output formats
                         pass
                 elif "Position:" in stripped_line:
                     # Parse line like "  Position: 0,0"
@@ -1735,6 +1737,8 @@ def _detect_monitors_wayland():  # noqa: PLR0912 - Complex detection logic for m
                         current_output["x"] = int(pos[0])
                         current_output["y"] = int(pos[1])
                     except (ValueError, IndexError):
+                        # Skip malformed position lines (defaults to 0,0 via current_output.get())
+                        # This is expected when parsing varied wlr-randr output formats
                         pass
             # Add last output
             if current_output and "width" in current_output:
@@ -1927,6 +1931,8 @@ def _parse_bitrate_bits(bstr: str) -> int:
             _BITRATE_CACHE[bstr] = result
         return result
     except (ValueError, IndexError):
+        # Return 0 for invalid bitrate strings (e.g., malformed input, non-numeric values)
+        # Caller can treat 0 as "no bitrate limit" or validate separately
         return 0
 
 

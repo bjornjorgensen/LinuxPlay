@@ -93,12 +93,13 @@ class TestNetworkModeCaching:
         # First call - should execute subprocess
         mode1 = detect_network_mode("192.168.1.1")
         assert mode1 == "lan"
-        assert call_count == 1
+        first_call_count = call_count
+        assert first_call_count == 1
 
         # Second call - should use cache
         mode2 = detect_network_mode("192.168.1.1")
         assert mode2 == "lan"
-        assert call_count == 1  # Should NOT increment
+        assert call_count == first_call_count  # Should NOT increment
 
     def test_cache_different_ips_tracked_separately(self, monkeypatch):
         """Test that different host IPs are cached separately."""
@@ -158,12 +159,13 @@ class TestNetworkModeCaching:
         # First call at time 0
         mode1 = detect_network_mode("192.168.1.1")
         assert mode1 == "lan"
-        assert call_count == 1
+        first_call_count = call_count
+        assert first_call_count == 1
 
         # Second call at time 0 (within TTL) - should use cache
         mode2 = detect_network_mode("192.168.1.1")
         assert mode2 == "lan"
-        assert call_count == 1
+        assert call_count == first_call_count  # Verify cache was used (no new call)
 
         # Advance time beyond TTL (5 minutes = 300 seconds)
         fake_time[0] += 301
