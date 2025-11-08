@@ -860,9 +860,6 @@ MAX_BITRATE_CACHE_SIZE = 100
 FFMPEG_CACHE_TTL_SECS = 300
 # CPU detection cache TTL (1 hour) - CPU doesn't hot-swap
 CPU_CACHE_TTL_SECS = 3600
-# Cache for ffmpeg encoder detection to avoid repeated subprocess calls
-_FFMPEG_ENCODER_CACHE = {}
-_FFMPEG_ENCODER_CACHE_TTL = 300  # 5 minutes TTL
 
 
 def _clear_hw_cache():
