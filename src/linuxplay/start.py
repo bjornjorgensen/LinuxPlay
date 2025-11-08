@@ -135,15 +135,13 @@ def ffmpeg_has_encoder(name: str) -> bool:
     try:
         # Check if cache needs refresh
         if _FFMPEG_ENCODERS_CACHE is None or (time.time() - _FFMPEG_ENCODERS_CACHE[1] >= FFMPEG_CACHE_TTL):
-            out = subprocess.check_output(
+            encoder_list = subprocess.check_output(
                 ["ffmpeg", "-hide_banner", "-encoders"],
                 stderr=subprocess.STDOUT,
                 universal_newlines=True,
                 timeout=5,
             ).lower()
-            _FFMPEG_ENCODERS_CACHE = (out, time.time())
-            # Use freshly fetched output
-            encoder_list = out
+            _FFMPEG_ENCODERS_CACHE = (encoder_list, time.time())
         else:
             # Use cached output
             encoder_list = _FFMPEG_ENCODERS_CACHE[0]
@@ -178,15 +176,13 @@ def ffmpeg_has_device(name: str) -> bool:
     try:
         # Check if cache needs refresh
         if _FFMPEG_DEVICES_CACHE is None or (time.time() - _FFMPEG_DEVICES_CACHE[1] >= FFMPEG_CACHE_TTL):
-            out = subprocess.check_output(
+            device_list = subprocess.check_output(
                 ["ffmpeg", "-hide_banner", "-devices"],
                 stderr=subprocess.STDOUT,
                 universal_newlines=True,
                 timeout=5,
             ).lower()
-            _FFMPEG_DEVICES_CACHE = (out, time.time())
-            # Use freshly fetched output
-            device_list = out
+            _FFMPEG_DEVICES_CACHE = (device_list, time.time())
         else:
             # Use cached output
             device_list = _FFMPEG_DEVICES_CACHE[0]
