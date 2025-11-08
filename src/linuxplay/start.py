@@ -919,7 +919,7 @@ class HostTab(QWidget):
             self._update_buttons()
             return
 
-        def _watch():
+        def _watch() -> None:
             """Watch host process and cleanup on exit (prevents zombie processes)."""
             try:
                 # Wait with timeout to prevent indefinite blocking
@@ -933,7 +933,7 @@ class HostTab(QWidget):
             except Exception as e:
                 logging.debug(f"Host process watch failed: {e}")
 
-            def done():
+            def done() -> None:
                 self.host_process = None
                 self._update_buttons()
 

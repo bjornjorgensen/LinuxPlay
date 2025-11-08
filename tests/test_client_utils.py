@@ -6,6 +6,7 @@ from pathlib import Path
 from linuxplay.client import (
     CLIENT_STATE,
     _best_ts_pkt_size,
+    _clear_network_mode_cache,
     _probe_hardware_capabilities,
     choose_auto_hwaccel,
     detect_network_mode,
@@ -19,6 +20,7 @@ class TestNetworkModeDetection:
 
     def test_detect_network_mode_wifi_linux(self, monkeypatch):
         """Test WiFi detection on Linux."""
+        _clear_network_mode_cache()  # Clear cache before test
 
         def mock_check_output(cmd, **_kwargs):
             if cmd[0] == "ip":
@@ -37,6 +39,7 @@ class TestNetworkModeDetection:
 
     def test_detect_network_mode_lan_linux(self, monkeypatch):
         """Test LAN detection on Linux."""
+        _clear_network_mode_cache()  # Clear cache before test
 
         def mock_check_output(cmd, **_kwargs):
             if cmd[0] == "ip":
@@ -54,6 +57,7 @@ class TestNetworkModeDetection:
 
     def test_detect_network_mode_fallback(self, monkeypatch):
         """Test fallback to LAN on detection failure."""
+        _clear_network_mode_cache()  # Clear cache before test
 
         def mock_check_output(*_args, **_kwargs):
             raise Exception("Command failed")
@@ -62,6 +66,142 @@ class TestNetworkModeDetection:
 
         mode = detect_network_mode("192.168.1.1")
         assert mode == "lan"  # Should default to LAN on error
+
+
+class TestNetworkModeCaching:
+    """Tests for network mode detection caching."""
+
+    def test_cache_returns_same_result_on_second_call(self, monkeypatch):
+        """Test that cache returns same result without re-executing subprocess."""
+        _clear_network_mode_cache()
+
+        call_count = 0
+
+        def mock_check_output(cmd, **_kwargs):
+            nonlocal call_count
+            call_count += 1
+            if cmd[0] == "ip":
+                return "dev eth0 src 192.168.1.100"
+            return ""
+
+        def mock_path_exists(_self):
+            return False
+
+        monkeypatch.setattr(subprocess, "check_output", mock_check_output)
+        monkeypatch.setattr(Path, "exists", mock_path_exists)
+
+        # First call - should execute subprocess
+        mode1 = detect_network_mode("192.168.1.1")
+        assert mode1 == "lan"
+        assert call_count == 1
+
+        # Second call - should use cache
+        mode2 = detect_network_mode("192.168.1.1")
+        assert mode2 == "lan"
+        assert call_count == 1  # Should NOT increment
+
+    def test_cache_different_ips_tracked_separately(self, monkeypatch):
+        """Test that different host IPs are cached separately."""
+        _clear_network_mode_cache()
+
+        def mock_check_output(cmd, **_kwargs):
+            if cmd[0] == "ip":
+                # Return different interfaces based on destination
+                if "192.168.1.1" in " ".join(cmd):
+                    return "dev wlp3s0 src 192.168.1.100"
+                return "dev eth0 src 10.0.0.100"
+            return ""
+
+        def mock_path_exists(_self):
+            return "wlp3s0" in str(_self)
+
+        monkeypatch.setattr(subprocess, "check_output", mock_check_output)
+        monkeypatch.setattr(Path, "exists", mock_path_exists)
+
+        mode1 = detect_network_mode("192.168.1.1")
+        mode2 = detect_network_mode("10.0.0.1")
+
+        # Different IPs should have different cached modes
+        assert mode1 == "wifi"
+        assert mode2 == "lan"
+
+    def test_cache_expires_after_ttl(self, monkeypatch):
+        """Test that cache expires after TTL period."""
+        import time
+
+        _clear_network_mode_cache()
+
+        call_count = 0
+
+        def mock_check_output(cmd, **_kwargs):
+            nonlocal call_count
+            call_count += 1
+            if cmd[0] == "ip":
+                return "dev eth0 src 192.168.1.100"
+            return ""
+
+        def mock_path_exists(_self):
+            return False
+
+        monkeypatch.setattr(subprocess, "check_output", mock_check_output)
+        monkeypatch.setattr(Path, "exists", mock_path_exists)
+
+        # Mock time to control cache expiry
+        original_time = time.time
+        fake_time = [original_time()]
+
+        def mock_time():
+            return fake_time[0]
+
+        monkeypatch.setattr(time, "time", mock_time)
+
+        # First call at time 0
+        mode1 = detect_network_mode("192.168.1.1")
+        assert mode1 == "lan"
+        assert call_count == 1
+
+        # Second call at time 0 (within TTL) - should use cache
+        mode2 = detect_network_mode("192.168.1.1")
+        assert mode2 == "lan"
+        assert call_count == 1
+
+        # Advance time beyond TTL (5 minutes = 300 seconds)
+        fake_time[0] += 301
+
+        # Third call after TTL expiry - should re-execute
+        mode3 = detect_network_mode("192.168.1.1")
+        assert mode3 == "lan"
+        assert call_count == 2
+
+    def test_clear_cache_clears_all_entries(self, monkeypatch):
+        """Test that clearing cache removes all entries."""
+        _clear_network_mode_cache()
+
+        call_count = 0
+
+        def mock_check_output(cmd, **_kwargs):
+            nonlocal call_count
+            call_count += 1
+            if cmd[0] == "ip":
+                return "dev eth0 src 192.168.1.100"
+            return ""
+
+        def mock_path_exists(_self):
+            return False
+
+        monkeypatch.setattr(subprocess, "check_output", mock_check_output)
+        monkeypatch.setattr(Path, "exists", mock_path_exists)
+
+        # First call
+        detect_network_mode("192.168.1.1")
+        assert call_count == 1
+
+        # Clear cache
+        _clear_network_mode_cache()
+
+        # Should re-execute after cache clear
+        detect_network_mode("192.168.1.1")
+        assert call_count == 2
 
 
 class TestHardwareAccelSelection:

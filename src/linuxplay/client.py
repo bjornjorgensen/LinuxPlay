@@ -172,6 +172,16 @@ class AudioProcessManager:
 audio_proc_manager = AudioProcessManager()
 CLIENT_STATE = {"connected": False, "last_heartbeat": 0.0, "net_mode": "lan", "reconnecting": False}
 
+# Network mode detection cache (avoid repeated subprocess calls)
+_NETWORK_MODE_CACHE: dict[str, tuple[str, float]] = {}  # {host_ip: (mode, timestamp)}
+NETWORK_MODE_CACHE_TTL: int = 300  # Cache for 5 minutes (networks don't change often)
+
+
+def _clear_network_mode_cache() -> None:
+    """Clear network mode cache (primarily for testing)."""
+    _NETWORK_MODE_CACHE.clear()
+
+
 try:
     HERE = Path(__file__).resolve().parent
     ffbin = HERE / "ffmpeg" / "bin"
@@ -188,7 +198,7 @@ except Exception as e:
     logging.debug(f"FFmpeg path init failed: {e}")
 
 
-def _probe_hardware_capabilities():
+def _probe_hardware_capabilities() -> None:
     try:
         vk_spec = importlib.util.find_spec("vulkan")
         vk_available = vk_spec is not None
@@ -204,7 +214,7 @@ def _probe_hardware_capabilities():
 _probe_hardware_capabilities()
 
 
-def ffmpeg_hwaccels():
+def ffmpeg_hwaccels() -> set[str]:
     try:
         out = subprocess.check_output(
             ["ffmpeg", "-hide_banner", "-hwaccels"], stderr=subprocess.STDOUT, universal_newlines=True
@@ -220,7 +230,7 @@ def ffmpeg_hwaccels():
         return set()
 
 
-def choose_auto_hwaccel():
+def choose_auto_hwaccel() -> str:
     accels = ffmpeg_hwaccels()
     if IS_WINDOWS:
         for cand in ("d3d11va", "cuda", "dxva2", "qsv"):
@@ -236,12 +246,19 @@ def choose_auto_hwaccel():
 def _best_ts_pkt_size(mtu_guess: int, ipv6: bool = False) -> int:
     """Calculate optimal MPEG-TS packet size for UDP transport.
 
+    MPEG-TS uses 188-byte packets. We fit as many as possible into MTU
+    while leaving room for UDP/IP headers (28 bytes IPv4, 48 bytes IPv6).
+
     Args:
         mtu_guess: Estimated MTU (default 1500 if invalid)
         ipv6: True if using IPv6 (larger headers)
 
     Returns:
-        Optimal packet size (multiple of 188 bytes)
+        Optimal packet size (multiple of 188 bytes, minimum 188)
+
+    Example:
+        >>> _best_ts_pkt_size(1500, False)  # Standard Ethernet
+        1316  # 7 TS packets (7 * 188 = 1316) + 28 bytes headers = 1344 < 1500
     """
     if mtu_guess <= 0:
         mtu_guess = 1500
@@ -289,21 +306,52 @@ def _detect_windows_network_mode() -> str:
             if any(pattern in iface_lower for pattern in ["wi-fi", "wireless", "wlan", "802.11"]):
                 return "wifi"
         return "lan"
-    except Exception:
+    except Exception as e:
         # psutil network detection failed - assume LAN for performance
+        logging.debug(f"Windows network detection failed: {e}")
         return "lan"
 
 
 def detect_network_mode(host_ip: str) -> str:
-    """Detect if connection is over LAN or WiFi."""
+    """Detect if connection is over LAN or WiFi with caching.
+
+    Performance optimization: Caches results per host IP to avoid repeated
+    subprocess calls. Cache TTL is 5 minutes (networks rarely change mid-session).
+
+    Args:
+        host_ip: Target host IP for route inspection (Linux only)
+
+    Returns:
+        "lan" or "wifi" (defaults to "lan" on detection failure)
+    """
+    # Check cache first (avoids expensive subprocess calls)
+    if host_ip in _NETWORK_MODE_CACHE:
+        mode, timestamp = _NETWORK_MODE_CACHE[host_ip]
+        if time.time() - timestamp < NETWORK_MODE_CACHE_TTL:
+            return mode
+
+    # Cache miss or expired - perform detection
     if IS_LINUX:
-        return _detect_linux_network_mode(host_ip)
-    if IS_WINDOWS:
-        return _detect_windows_network_mode()
-    return "lan"
+        mode = _detect_linux_network_mode(host_ip)
+    elif IS_WINDOWS:
+        mode = _detect_windows_network_mode()
+    else:
+        mode = "lan"
+
+    # Update cache
+    _NETWORK_MODE_CACHE[host_ip] = (mode, time.time())
+    return mode
 
 
 def _read_pem_cert_fingerprint(pem_path: str) -> str:
+    """Extract SHA256 fingerprint from PEM certificate.
+
+    Args:
+        pem_path: Path to PEM certificate file
+
+    Returns:
+        Uppercase hex fingerprint, or empty string on error
+    """
     try:
         data = Path(pem_path).read_text(encoding="utf-8")
         m = re.search(r"-----BEGIN CERTIFICATE-----\s+([A-Za-z0-9+/=\s]+?)\s+-----END CERTIFICATE-----", data, re.S)
@@ -311,8 +359,9 @@ def _read_pem_cert_fingerprint(pem_path: str) -> str:
             return ""
         der = base64.b64decode("".join(m.group(1).split()))
         return hashlib.sha256(der).hexdigest().upper()
-    except Exception:
+    except Exception as e:
         # Certificate file missing or malformed - return empty string for auth fallback
+        logging.debug(f"Certificate fingerprint extraction failed: {e}")
         return ""
 
 
@@ -367,7 +416,7 @@ def _ensure_client_keypair(key_path: Path) -> bool:
         return False
 
 
-def _generate_csr(private_key_path: Path, client_id: str):
+def _generate_csr(private_key_path: Path, client_id: str) -> bytes:
     """
     Generate Certificate Signing Request.
     Returns CSR in PEM format (bytes).
@@ -397,7 +446,7 @@ def _generate_csr(private_key_path: Path, client_id: str):
         return b""
 
 
-def _validate_host_ca_fingerprint(ca_cert_pem, host_ip: str) -> bool:
+def _validate_host_ca_fingerprint(ca_cert_pem: bytes, host_ip: str) -> bool:
     """
     Validate host CA fingerprint using Trust On First Use (TOFU).
     On first connection, pins the fingerprint.
@@ -447,7 +496,7 @@ def _validate_host_ca_fingerprint(ca_cert_pem, host_ip: str) -> bool:
         return False
 
 
-def _sign_challenge(private_key_path: Path, challenge):
+def _sign_challenge(private_key_path: Path, challenge: bytes) -> bytes:
     """
     Sign challenge with client's private key.
     Returns signature bytes.
@@ -472,8 +521,12 @@ def _sign_challenge(private_key_path: Path, challenge):
         return b""
 
 
-def _get_client_paths():
-    """Get paths for client certificates and keys."""
+def _get_client_paths() -> tuple[Path, Path, Path, Path]:
+    """Get paths for client certificates and keys.
+
+    Returns:
+        Tuple of (client_dir, cert_path, key_path, ca_path)
+    """
     try:
         client_dir = Path.home() / ".linuxplay"
     except Exception:
@@ -488,7 +541,9 @@ def _get_client_paths():
     )
 
 
-def _handle_challenge_response(sock, cert_path, key_path, ca_path, host_ip):
+def _handle_challenge_response(
+    sock: socket.socket, cert_path: Path, key_path: Path, ca_path: Path, host_ip: str
+) -> tuple[bool | None, tuple[str, str] | str | None]:
     """Handle challenge-response authentication with existing certificate.
 
     Returns: (success: bool, result: tuple | None)
@@ -559,7 +614,9 @@ def _handle_challenge_response(sock, cert_path, key_path, ca_path, host_ip):
     return (None, "failed")
 
 
-def _handle_csr_submission(sock, key_path, cert_path, ca_path, host_ip, pin):  # noqa: PLR0913
+def _handle_csr_submission(  # noqa: PLR0913
+    sock: socket.socket, key_path: Path, cert_path: Path, ca_path: Path, host_ip: str, pin: str
+) -> tuple[bool | None, tuple[str, str] | str | None]:
     """Handle CSR submission for first-time authentication.
 
     Returns: (success: bool, result: tuple | None)
@@ -659,7 +716,9 @@ def _handle_csr_submission(sock, key_path, cert_path, ca_path, host_ip, pin):  #
     return (None, "failed")
 
 
-def _handle_legacy_fingerprint_auth(sock, cert_path):
+def _handle_legacy_fingerprint_auth(
+    sock: socket.socket, cert_path: Path
+) -> tuple[bool | None, tuple[str, str] | str | None]:
     """Handle legacy fingerprint-only authentication.
 
     Returns: (success: bool, result: tuple | None)
@@ -687,7 +746,7 @@ def _handle_legacy_fingerprint_auth(sock, cert_path):
     return (None, "failed")
 
 
-def _handle_legacy_pin_auth(sock, pin):
+def _handle_legacy_pin_auth(sock: socket.socket, pin: str) -> tuple[bool | None, tuple[str, str] | str | None]:
     """Handle legacy PIN-only authentication.
 
     Returns: (success: bool, result: tuple | None)
@@ -733,22 +792,28 @@ def _handle_legacy_pin_auth(sock, pin):
     return (False, None)
 
 
-def tcp_handshake_client(host_ip: str, pin: str | None = None) -> tuple[bool, tuple | None]:
-    """
-    Authenticate with host using new secure protocol.
+def tcp_handshake_client(host_ip: str, pin: str | None = None) -> tuple[bool, tuple[str, str] | None]:
+    """Authenticate with host using secure certificate-based protocol.
 
-    Priority order:
-    1. NEW: Challenge-response with existing cert (signature verification)
+    Authentication Priority (tries in order):
+    1. NEW: Challenge-response with existing cert (RSA signature verification)
     2. NEW: CSR submission with PIN (first-time secure auth)
     3. LEGACY: Fingerprint-only (deprecated, for old hosts)
     4. LEGACY: PIN-only (deprecated, insecure)
 
+    Security:
+        - RSA 4096-bit challenge-response (modern)
+        - Trust On First Use (TOFU) for host CA fingerprint
+        - Private keys never transmitted
+
     Args:
         host_ip: Host IP address to connect to
-        pin: Optional 6-digit PIN for first-time auth
+        pin: Optional 6-digit PIN for first-time auth (prompted if needed)
 
     Returns:
         Tuple of (success: bool, result: tuple[encoder, monitor_info] | None)
+        On success: (True, ("nvenc", "1920x1080+0+0;1920x1080+1920+0"))
+        On failure: (False, None)
     """
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.settimeout(15)  # Increased timeout for crypto operations (was 10s)
@@ -796,8 +861,20 @@ def tcp_handshake_client(host_ip: str, pin: str | None = None) -> tuple[bool, tu
         sock.close()
         return result
 
+    except (TimeoutError, socket.gaierror) as e:
+        logging.error("Network error during handshake: %s", e)
+        _show_error("Network Error", f"Cannot reach host {host_ip}:{TCP_HANDSHAKE_PORT}\n{e}")
+        with contextlib.suppress(Exception):
+            sock.close()
+        return (False, None)
+    except (ConnectionRefusedError, ConnectionResetError) as e:
+        logging.error("Connection rejected: %s", e)
+        _show_error("Connection Refused", f"Host refused connection\n{e}")
+        with contextlib.suppress(Exception):
+            sock.close()
+        return (False, None)
     except Exception as e:
-        logging.error("Handshake failed: %s", e)
+        logging.error("Handshake failed: %s", e, exc_info=True)
         _show_error("Connection Error", f"Handshake failed:\n{e}")
         with contextlib.suppress(Exception):
             sock.close()
@@ -807,11 +884,19 @@ def tcp_handshake_client(host_ip: str, pin: str | None = None) -> tuple[bool, tu
 def heartbeat_responder(host_ip: str) -> threading.Thread:
     """Start heartbeat responder thread for connection keepalive.
 
+    Protocol: Host sends PING every 1s, client responds with PONG.
+    Connection considered lost if no PING received for HEARTBEAT_TIMEOUT_SECS (10s).
+
+    Firewall-free: Uses outbound-only ephemeral port (no inbound port needed).
+
+    Args:
+        host_ip: Host IP address for heartbeat destination
+
     Returns:
         Started daemon thread (automatically cleaned up on exit)
     """
 
-    def loop():
+    def loop() -> None:
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             # Optimize for heartbeat responsiveness
@@ -859,14 +944,14 @@ def heartbeat_responder(host_ip: str) -> threading.Thread:
     return t
 
 
-def clipboard_listener(app_clipboard, host_ip: str) -> threading.Thread:
+def clipboard_listener(app_clipboard: object, host_ip: str) -> threading.Thread:
     """Start clipboard sync thread.
 
     Returns:
         Started daemon thread (automatically cleaned up on exit)
     """
 
-    def loop():
+    def loop() -> None:
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             # Optimize for clipboard data transfer
@@ -920,7 +1005,7 @@ def audio_listener(host_ip: str) -> threading.Thread:
         Started daemon thread (automatically cleaned up on exit)
     """
 
-    def loop():
+    def loop() -> None:
         cmd = [
             "ffplay",
             "-hide_banner",
@@ -965,7 +1050,7 @@ def audio_listener(host_ip: str) -> threading.Thread:
 class DecoderThread(QThread):
     frame_ready = pyqtSignal(object)
 
-    def __init__(self, input_url, decoder_opts, ultra=False):
+    def __init__(self, input_url: str, decoder_opts: dict[str, str] | None, ultra: bool = False) -> None:
         super().__init__()
         self.input_url = input_url
         self.decoder_opts = dict(decoder_opts or {})
@@ -990,11 +1075,11 @@ class DecoderThread(QThread):
         self._has_first_frame = False
         self._hw_name = None
 
-    def _open_container(self):
+    def _open_container(self) -> av.container.InputContainer:
         logging.debug("Opening stream with opts: %s", self.decoder_opts)
         return av.open(self.input_url, format="mpegts", options=self.decoder_opts)
 
-    def _setup_codec_context(self, cc):
+    def _setup_codec_context(self, cc: av.codec.CodecContext) -> None:
         """Configure codec context for low-latency decoding."""
         cc.thread_count = 1 if self.ultra else 2
 
@@ -1012,7 +1097,7 @@ class DecoderThread(QThread):
         with contextlib.suppress(Exception):
             cc.flags2 = "+fast"
 
-    def _init_hardware_decode(self, cc):
+    def _init_hardware_decode(self, cc: av.codec.CodecContext) -> None:
         """Initialize hardware decode context if available."""
         hw_device = getattr(cc, "hw_device_ctx", None)
         if hw_device is not None or "hwaccel" not in self.decoder_opts:
@@ -1055,7 +1140,7 @@ class DecoderThread(QThread):
             self.decoder_opts.pop("hwaccel", None)
             self.decoder_opts.pop("hwaccel_device", None)
 
-    def _extract_dmabuf_fd(self, frame):
+    def _extract_dmabuf_fd(self, frame: av.VideoFrame) -> int | None:
         """Extract DMA-BUF file descriptor from hardware frame if available."""
         try:
             if not frame.hw_frames_ctx:
@@ -1073,7 +1158,7 @@ class DecoderThread(QThread):
             pass
         return None
 
-    def _process_frame(self, frame, t_decode):
+    def _process_frame(self, frame: av.VideoFrame, t_decode: float) -> bool:
         """Process and emit a decoded frame."""
         if not self._running or not frame or frame.is_corrupt:
             return False
@@ -1112,7 +1197,7 @@ class DecoderThread(QThread):
         self._last_emit = time.time()
         return True
 
-    def _decode_loop(self, container):
+    def _decode_loop(self, container: av.container.InputContainer) -> None:
         """Main decode loop for processing video frames."""
         vstream = next((s for s in container.streams if s.type == "video"), None)
         if not vstream:
@@ -1130,7 +1215,7 @@ class DecoderThread(QThread):
                 break
             self._process_frame(frame, t_decode)
 
-    def run(self):
+    def run(self) -> None:
         while self._running:
             container = None
             try:
@@ -1168,24 +1253,24 @@ class DecoderThread(QThread):
                     # Container already closed or cleanup failed - ignore during shutdown
                     pass
 
-    def stop(self):
+    def stop(self) -> None:
         self._running = False
         time.sleep(0.05)
 
 
 class RenderBackend:
-    def render_frame(self, frame_tuple):
+    def render_frame(self, frame_tuple) -> None:
         pass
 
-    def is_valid(self):
+    def is_valid(self) -> bool:
         return False
 
-    def name(self):
+    def name(self) -> str:
         return "unknown"
 
 
 class RenderKMSDRM(RenderBackend):
-    def __init__(self):
+    def __init__(self) -> None:
         self.valid = False
         self.fd = None
         self.gbm = None
@@ -1246,10 +1331,10 @@ class RenderKMSDRM(RenderBackend):
     def is_valid(self):
         return self.valid
 
-    def name(self):
+    def name(self) -> str:
         return "KMSDRM"
 
-    def _alloc_bo(self, w, h):
+    def _alloc_bo(self, w: int, h: int) -> None:
         if not self.valid or not self.gbm:
             return
         try:
@@ -1276,7 +1361,7 @@ class RenderKMSDRM(RenderBackend):
             logging.debug(f"KMSDRM alloc failed: {e}")
             self.valid = False
 
-    def _import_dmabuf(self, fd, w, h):
+    def _import_dmabuf(self, fd: int, w: int, h: int) -> np.ndarray | None:
         try:
             size = w * h * 4
             with mmap.mmap(fd, size, mmap.MAP_SHARED, mmap.PROT_READ) as buf:
@@ -1287,7 +1372,7 @@ class RenderKMSDRM(RenderBackend):
             logging.debug(f"KMSDRM: dmabuf import failed: {e}")
             return None
 
-    def render_frame(self, frame_tuple):
+    def render_frame(self, frame_tuple: tuple) -> None:
         if not self.valid:
             return
         t0 = time.perf_counter()
@@ -1330,7 +1415,7 @@ class RenderKMSDRM(RenderBackend):
 
 
 class RenderVulkan(RenderBackend):
-    def __init__(self):
+    def __init__(self) -> None:
         try:
             self.valid = True
         except Exception:
@@ -1340,10 +1425,10 @@ class RenderVulkan(RenderBackend):
     def is_valid(self):
         return self.valid
 
-    def name(self):
+    def name(self) -> str:
         return "Vulkan"
 
-    def render_frame(self, frame_tuple):
+    def render_frame(self, frame_tuple) -> None:
         try:
             if (
                 isinstance(frame_tuple, tuple)
@@ -1364,16 +1449,16 @@ class RenderVulkan(RenderBackend):
 
 
 class RenderOpenGL(RenderBackend):
-    def __init__(self):
+    def __init__(self) -> None:
         self.valid = True
 
     def is_valid(self):
         return self.valid
 
-    def name(self):
+    def name(self) -> str:
         return "OpenGL"
 
-    def render_frame(self, frame_tuple):
+    def render_frame(self, frame_tuple) -> None:
         try:
             if (
                 isinstance(frame_tuple, tuple)
@@ -1413,7 +1498,7 @@ def pick_best_renderer():
 
 
 class VideoWidgetGL(QOpenGLWidget):
-    def __init__(self, control_callback, rwidth, rheight, offset_x, offset_y, host_ip, parent=None):  # noqa: PLR0913
+    def __init__(self, control_callback, rwidth, rheight, offset_x, offset_y, host_ip, parent=None) -> None:  # noqa: PLR0913
         super().__init__(parent)
         self.setMouseTracking(True)
         self.setFocusPolicy(Qt.StrongFocus)
@@ -1464,7 +1549,7 @@ class VideoWidgetGL(QOpenGLWidget):
             logging.info(f"Bound to device: {self.renderer.device_path}")
         logging.info("────────────────────────────────────────────")
 
-    def on_clipboard_change(self):
+    def on_clipboard_change(self) -> None:
         new_text = self.clipboard.text()
         if self.ignore_clipboard or not new_text or new_text == self.last_clipboard:
             return
@@ -1477,19 +1562,26 @@ class VideoWidgetGL(QOpenGLWidget):
             # Clipboard sync failed (network error) - non-critical, skip update
             pass
 
-    def initializeGL(self):
+    def initializeGL(self) -> None:
+        """Initialize OpenGL context and resources.
+
+        Creates texture and PBO triple buffer for zero-copy video upload.
+        Defers initialization if context not ready (happens on first paintGL).
+        """
         try:
             glDisable(GL_DEPTH_TEST)
             glDisable(GL_DITHER)
             glClearColor(0.0, 0.0, 0.0, 1.0)
             self.texture_id = glGenTextures(1)
-            self._initialize_texture(self.texture_width, self.texture_height)
+            if self.texture_id:
+                self._initialize_texture(self.texture_width, self.texture_height)
+                logging.debug(f"OpenGL initialized: texture {self.texture_width}x{self.texture_height}")
         except Exception as e:
             logging.warning(f"OpenGL initialization deferred: {e}")
             # Context will be ready on first paintGL call
             self.texture_id = None
 
-    def _initialize_texture(self, w, h):
+    def _initialize_texture(self, w, h) -> None:
         glBindTexture(GL_TEXTURE_2D, self.texture_id)
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR)
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
@@ -1513,15 +1605,34 @@ class VideoWidgetGL(QOpenGLWidget):
         self.current_pbo = 0
         glFlush()
 
-    def resizeTexture(self, w, h):
+    def resizeTexture(self, w, h) -> None:
         if (w, h) != (self.texture_width, self.texture_height):
             logging.info(f"Resize texture {self.texture_width}x{self.texture_height} → {w}x{h}")
             self._pending_resize = (w, h)
 
-    def paintGL(self):
+    def paintGL(self) -> None:
+        """Render video frame using OpenGL with PBO triple buffering.
+
+        PBO triple buffering workflow:
+        1. Upload frame data to current PBO (asynchronous DMA)
+        2. Bind previous PBO to texture (data already transferred)
+        3. Rotate to next PBO for next frame
+
+        Performance: Zero-copy upload, PBO enables async GPU transfer.
+        """
         if not self.frame_data:
             glClear(GL_COLOR_BUFFER_BIT)
             return
+
+        # Safety check: Ensure texture is initialized
+        if not self.texture_id:
+            logging.debug("Texture not ready, reinitializing...")
+            try:
+                self.texture_id = glGenTextures(1)
+                self._initialize_texture(self.texture_width, self.texture_height)
+            except Exception as e:
+                logging.error(f"Texture initialization failed: {e}")
+                return
 
         arr, fw, fh = self.frame_data
         if self._pending_resize:
@@ -1570,7 +1681,7 @@ class VideoWidgetGL(QOpenGLWidget):
 
         self.current_pbo = (self.current_pbo + 1) % len(self.pbo_ids)
 
-    def updateFrame(self, frame_tuple):
+    def updateFrame(self, frame_tuple) -> None:
         self.frame_data = frame_tuple
         _, fw, fh = frame_tuple
         if (fw, fh) != (self.texture_width, self.texture_height):
@@ -1599,7 +1710,7 @@ class VideoWidgetGL(QOpenGLWidget):
                 self._last_draw = t
                 self.update()
 
-    def _flush_pending_mouse(self):
+    def _flush_pending_mouse(self) -> None:
         if not hasattr(self, "_pending_mouse") or self._pending_mouse is None:
             return
         now = time.time()
@@ -1610,14 +1721,35 @@ class VideoWidgetGL(QOpenGLWidget):
         self._last_mouse_ts = now
         self._pending_mouse = None
 
-    def send_mouse_packet(self, pkt_type, bmask, x, y):
+    def send_mouse_packet(self, pkt_type, bmask, x, y) -> None:
         msg = f"MOUSE_PKT {pkt_type} {bmask} {x} {y}"
         with contextlib.suppress(Exception):
             self.control_callback(msg)
 
-    def _scaled_mouse_coords(self, e):
+    def _scaled_mouse_coords(self, e) -> tuple[int, int]:
+        """Transform window coordinates to remote display coordinates.
+
+        Handles aspect ratio preservation with letterboxing (black bars).
+        Maps click position in letterboxed window to actual pixel on remote display.
+
+        Args:
+            e: Mouse event with x() and y() methods
+
+        Returns:
+            Tuple of (remote_x, remote_y) in host display coordinates
+
+        Example:
+            Window: 1920x1200, Frame: 1920x1080 (16:9 in 16:10 window)
+            Click at (960, 600) → Maps to center of frame (960, 540)
+            Black bars: Top/bottom 60px each (letterbox)
+        """
         ww, wh = self.width(), self.height()
         fw, fh = self.texture_width, self.texture_height
+
+        # Prevent division by zero
+        if fh == 0 or wh == 0:
+            return self.offset_x, self.offset_y
+
         aspect_tex = fw / float(fh)
         aspect_win = ww / float(wh)
 
@@ -1632,9 +1764,14 @@ class VideoWidgetGL(QOpenGLWidget):
             offset_x = 0
             offset_y = (wh - view_h) / 2.0
 
+        # Prevent division by zero in coordinate transform
+        if view_w == 0 or view_h == 0:
+            return self.offset_x, self.offset_y
+
         nx = (e.x() - offset_x) / view_w
         ny = (e.y() - offset_y) / view_h
 
+        # Clamp to valid normalized range
         nx = min(max(nx, 0.0), 1.0)
         ny = min(max(ny, 0.0), 1.0)
 
@@ -1642,7 +1779,7 @@ class VideoWidgetGL(QOpenGLWidget):
         ry = self.offset_y + int(ny * fh)
         return rx, ry
 
-    def mousePressEvent(self, e):
+    def mousePressEvent(self, e) -> None:
         bmap = {Qt.LeftButton: 1, Qt.MiddleButton: 2, Qt.RightButton: 4}
         bmask = bmap.get(e.button(), 0)
         if bmask:
@@ -1650,7 +1787,7 @@ class VideoWidgetGL(QOpenGLWidget):
             self.send_mouse_packet(1, bmask, rx, ry)
         e.accept()
 
-    def mouseMoveEvent(self, e):
+    def mouseMoveEvent(self, e) -> None:
         rx, ry = self._scaled_mouse_coords(e)
         buttons = 0
         if e.buttons() & Qt.LeftButton:
@@ -1667,7 +1804,7 @@ class VideoWidgetGL(QOpenGLWidget):
         self._flush_pending_mouse()
         e.accept()
 
-    def mouseReleaseEvent(self, e):
+    def mouseReleaseEvent(self, e) -> None:
         bmap = {Qt.LeftButton: 1, Qt.MiddleButton: 2, Qt.RightButton: 4}
         bmask = bmap.get(e.button(), 0)
         if bmask:
@@ -1675,7 +1812,7 @@ class VideoWidgetGL(QOpenGLWidget):
             self.send_mouse_packet(3, bmask, rx, ry)
         e.accept()
 
-    def wheelEvent(self, e):
+    def wheelEvent(self, e) -> None:
         d = e.angleDelta()
         if d.y() != 0:
             b = "4" if d.y() > 0 else "5"
@@ -1685,7 +1822,7 @@ class VideoWidgetGL(QOpenGLWidget):
             self.control_callback(f"MOUSE_SCROLL {b}")
         e.accept()
 
-    def keyPressEvent(self, e):
+    def keyPressEvent(self, e) -> None:
         if e.isAutoRepeat():
             return
         key_name = self._get_key_name(e)
@@ -1693,7 +1830,7 @@ class VideoWidgetGL(QOpenGLWidget):
             self.control_callback(f"KEY_PRESS {key_name}")
         e.accept()
 
-    def keyReleaseEvent(self, e):
+    def keyReleaseEvent(self, e) -> None:
         if e.isAutoRepeat():
             return
         key_name = self._get_key_name(e)
@@ -1746,7 +1883,7 @@ class VideoWidgetGL(QOpenGLWidget):
 
 
 class GamepadThread(threading.Thread):
-    def __init__(self, host_ip, port, path_hint=None):
+    def __init__(self, host_ip, port, path_hint=None) -> None:
         super().__init__(daemon=True)
         self.host_ip = host_ip
         self.port = port
@@ -1808,7 +1945,7 @@ class GamepadThread(threading.Thread):
         candidates.sort(key=score, reverse=True)
         return candidates[0]
 
-    def run(self):
+    def run(self) -> None:
         if not IS_LINUX:
             return
         if not HAVE_EVDEV:
@@ -1842,7 +1979,7 @@ class GamepadThread(threading.Thread):
         with contextlib.suppress(Exception):
             dev.ungrab()
 
-    def stop(self):
+    def stop(self) -> None:
         self._running = False
         with contextlib.suppress(Exception):
             self.sock.close()
@@ -1863,7 +2000,7 @@ class MainWindow(QMainWindow):
         ultra=False,
         gamepad="disable",
         gamepad_dev=None,
-    ):
+    ) -> None:
         super().__init__(parent)
         self.setWindowTitle("LinuxPlay")
         self.texture_width, self.texture_height = rwidth, rheight
@@ -1915,7 +2052,7 @@ class MainWindow(QMainWindow):
         self._start_background_threads()
         self._start_timers()
 
-    def _start_timers(self):
+    def _start_timers(self) -> None:
         self.clip_timer = QTimer(self)
         self.clip_timer.timeout.connect(self._drain_clipboard_inbox)
         self.clip_timer.start(10)
@@ -1928,7 +2065,7 @@ class MainWindow(QMainWindow):
         self.stats_timer.timeout.connect(self._update_stats)
         self.stats_timer.start(1000)
 
-    def _start_background_threads(self):
+    def _start_background_threads(self) -> None:
         try:
             self._heartbeat_thread = heartbeat_responder(self.host_ip)
         except Exception as e:
@@ -1961,14 +2098,14 @@ class MainWindow(QMainWindow):
                 logging.error("Gamepad thread failed: %s", e)
                 self._gp_thread = None
 
-    def _start_decoder_thread(self):
+    def _start_decoder_thread(self) -> None:
         self.decoder_thread = DecoderThread(self.video_url, self.decoder_opts, ultra=self.ultra)
         self.decoder_thread.frame_ready.connect(self.video_widget.updateFrame, Qt.DirectConnection)
         self.decoder_thread.finished.connect(self._on_decoder_exit)
         self.decoder_thread.start()
         logging.info("Decoder thread started")
 
-    def _on_decoder_exit(self):
+    def _on_decoder_exit(self) -> None:
         if not self._running:
             return
         self._restarts += 1
@@ -1976,14 +2113,14 @@ class MainWindow(QMainWindow):
         logging.warning(f"Decoder thread exited — attempting restart in {delay:.1f}s")
         QTimer.singleShot(int(delay * 1000), self._restart_decoder_safe)
 
-    def _restart_decoder_safe(self):
+    def _restart_decoder_safe(self) -> None:
         if self._running:
             try:
                 self._start_decoder_thread()
             except Exception as e:
                 logging.error(f"Decoder restart failed: {e}")
 
-    def _poll_connection_state(self):
+    def _poll_connection_state(self) -> None:
         now = time.time()
         age = now - CLIENT_STATE.get("last_heartbeat", 0)
         if age > 6 and CLIENT_STATE["connected"]:
@@ -1993,7 +2130,7 @@ class MainWindow(QMainWindow):
             CLIENT_STATE["connected"], CLIENT_STATE["reconnecting"] = True, False
             logging.info("Heartbeat restored")
 
-    def _read_gpu_usage(self):
+    def _read_gpu_usage(self) -> str | None:
         if not HAVE_PYNVML:
             return None
         try:
@@ -2028,7 +2165,7 @@ class MainWindow(QMainWindow):
 
         return "N/A"
 
-    def _update_stats(self):
+    def _update_stats(self) -> None:
         try:
             cpu = self._proc.cpu_percent(interval=None)
             mem = self._proc.memory_info().rss / (1024 * 1024)
@@ -2052,7 +2189,7 @@ class MainWindow(QMainWindow):
         except Exception as e:
             logging.debug(f"Stats update failed: {e}")
 
-    def _drain_clipboard_inbox(self):
+    def _drain_clipboard_inbox(self) -> None:
         changed = False
         while not CLIPBOARD_INBOX.empty():
             text = CLIPBOARD_INBOX.get_nowait()
@@ -2066,13 +2203,13 @@ class MainWindow(QMainWindow):
         if changed:
             self.video_widget.last_clipboard = QApplication.clipboard().text()
 
-    def dragEnterEvent(self, event):
+    def dragEnterEvent(self, event) -> None:
         if event.mimeData().hasUrls():
             event.acceptProposedAction()
         else:
             event.ignore()
 
-    def dropEvent(self, event):
+    def dropEvent(self, event) -> None:
         urls = event.mimeData().urls()
         if not urls:
             event.ignore()
@@ -2091,7 +2228,7 @@ class MainWindow(QMainWindow):
             threading.Thread(target=self.upload_file, args=(fpath,), daemon=True).start()
         event.acceptProposedAction()
 
-    def upload_file(self, file_path):
+    def upload_file(self, file_path) -> None:
         try:
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
                 sock.connect((self.control_addr[0], UDP_FILE_PORT))
@@ -2110,13 +2247,13 @@ class MainWindow(QMainWindow):
         except Exception as e:
             logging.error(f"Upload error for {file_path}: {e}")
 
-    def send_control(self, msg):
+    def send_control(self, msg) -> None:
         try:
             self.control_sock.sendto(msg.encode("utf-8"), self.control_addr)
         except Exception as e:
             logging.error(f"Control send error: {e}")
 
-    def closeEvent(self, event):
+    def closeEvent(self, event) -> None:
         r"""Clean up resources on window close.
 
         Example commands:
@@ -2180,8 +2317,14 @@ class MainWindow(QMainWindow):
         event.accept()
 
 
-def _setup_environment_vars():
-    """Clean environment and set up OpenGL/Qt configuration."""
+def _setup_environment_vars() -> None:
+    """Clean environment and set up OpenGL/Qt configuration.
+
+    Performance rationale:
+        - Removes MESA_*/LIBGL_* to prevent environment conflicts
+        - Windows: Uses ANGLE (DirectX backend) for better compatibility
+        - Linux: Uses desktop OpenGL with XCB-EGL for best performance
+    """
     for var in list(os.environ):
         if var.startswith(("MESA_", "LIBGL_", "__GL_", "QT_LOGGING", "vblank_mode")):
             del os.environ[var]
@@ -2194,8 +2337,16 @@ def _setup_environment_vars():
         os.environ.setdefault("QT_XCB_GL_INTEGRATION", "xcb_egl")
 
 
-def _setup_logging(debug: bool):
-    """Configure logging handlers."""
+def _setup_logging(debug: bool) -> None:
+    """Configure logging handlers with console and file output.
+
+    Args:
+        debug: Enable DEBUG level logging (default: INFO)
+
+    Output:
+        - Console: stdout with colored timestamps
+        - File: linuxplay_client.log (overwrite mode)
+    """
     log_level = logging.DEBUG if debug else logging.INFO
     log_format = "%(asctime)s [%(levelname)s] %(message)s"
     log_datefmt = "%H:%M:%S"
@@ -2221,7 +2372,20 @@ def _setup_logging(debug: bool):
 
 
 def _parse_monitor_info(monitor_info_str: str) -> list[tuple[int, int, int, int]]:
-    """Parse monitor information from handshake. Returns list of (w, h, ox, oy) tuples."""
+    """Parse monitor information from handshake response.
+
+    Format: "1920x1080+0+0;1920x1080+1920+0" (width x height + offset_x + offset_y)
+
+    Args:
+        monitor_info_str: Semicolon-separated monitor specs
+
+    Returns:
+        List of (width, height, offset_x, offset_y) tuples
+
+    Example:
+        >>> _parse_monitor_info("1920x1080+0+0;1920x1080+1920+0")
+        [(1920, 1080, 0, 0), (1920, 1080, 1920, 0)]
+    """
     try:
         monitors = []
         parts = [p for p in monitor_info_str.split(";") if p]
@@ -2242,8 +2406,22 @@ def _parse_monitor_info(monitor_info_str: str) -> list[tuple[int, int, int, int]
         return [(w, h, 0, 0)]
 
 
-def _setup_decoder_opts(hwaccel: str, ultra: bool) -> dict:
-    """Configure decoder options based on hardware acceleration and ultra mode."""
+def _setup_decoder_opts(hwaccel: str, ultra: bool) -> dict[str, str]:
+    """Configure PyAV decoder options for low-latency video decoding.
+
+    Args:
+        hwaccel: Hardware acceleration method ("vaapi", "cuda", "d3d11va", etc.)
+        ultra: Enable ultra-low-latency mode (LAN only)
+
+    Returns:
+        Dictionary of FFmpeg/PyAV decoder options
+
+    Ultra Mode Settings:
+        - No buffering: fflags=nobuffer, flags=low_delay
+        - Minimal probing: probesize=32, analyzeduration=0
+        - Single thread: threads=1 (reduces latency)
+        - Skip non-reference frames: skip_frame=noref
+    """
     decoder_opts = {}
     if hwaccel != "cpu":
         decoder_opts["hwaccel"] = hwaccel
@@ -2314,7 +2492,7 @@ def _create_windows(args, monitors: list, decoder_opts: dict, ultra: bool) -> li
     return windows
 
 
-def main():
+def main() -> None:
     p = argparse.ArgumentParser(description="LinuxPlay Client (Linux/Windows)")
     p.add_argument("--decoder", choices=["none", "h.264", "h.265"], default="none")
     p.add_argument("--host_ip", required=True)

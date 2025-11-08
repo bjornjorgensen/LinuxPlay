@@ -38,11 +38,11 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = [
-    "ruff>=0.14.3",
+    "ruff>=0.14.4",
     "bandit>=1.8.6",
 ]
 test = [
-    "pytest>=8.4.2",
+    "pytest>=9.0.0",
     "pytest-cov>=7.0.0",
     "pytest-mock>=3.11.0",
     "pytest-timeout>=2.1.0",
@@ -98,6 +98,10 @@ select = [
     "PL",    # pylint
     "PERF",  # perflint
     "RUF",   # ruff-specific rules
+    "ANN",   # flake8-annotations
+    "S",     # flake8-bandit (security)
+    "ASYNC", # flake8-async (async safety)
+    "FBT",   # flake8-boolean-trap (function call clarity)
 ]
 ignore = [
     "PLR0915", # too many statements
@@ -111,10 +115,41 @@ unfixable = []
 
 [tool.ruff.lint.per-file-ignores]
 "__init__.py" = ["F401"]
-"src/linuxplay/client.py" = ["PLC0415", "PLR2004"]
-"src/linuxplay/host.py" = ["PLC0415", "ERA001"]
-"src/linuxplay/start.py" = ["PLW0603"]
-"tests/test_*.py" = ["PLC0415", "PLR2004"]
+"src/linuxplay/client.py" = [
+    "PLC0415", "PLR2004",
+    "S110", "S112",  # Hardware decode fallback exception handling (intentional pass/continue)
+    "S603", "S607",  # FFmpeg subprocess calls (hardcoded commands, no user input)
+    "FBT001", "FBT002", "FBT003",  # Qt API and network utility boolean args
+    "ANN001", "ANN201", "ANN202",  # Complex Qt/PyAV/renderer types (incremental improvement)
+]
+"src/linuxplay/host.py" = [
+    "PLC0415", "ERA001",
+    "S110", "S112",  # Graceful cleanup exception handling
+    "S603", "S607",  # FFmpeg/system tool subprocess calls (validated input)
+    "S104",          # String comparison against "0.0.0.0" for validation (not actual binding)
+    "FBT001", "FBT002", "FBT003",  # Boolean args for control flags (use_signals, secure, etc)
+    "ANN001", "ANN201", "ANN202",  # Complex dict/Any types (incremental improvement)
+]
+"src/linuxplay/start.py" = [
+    "PLW0603",
+    "S110", "S112",  # FFmpeg probing exception handling
+    "S603", "S607",  # FFmpeg detection subprocess calls
+    "S108",          # Intentional /tmp usage for cross-platform compatibility
+    "FBT001",        # Allow boolean-typed args in Qt UI callbacks
+    "ANN001",        # Qt event parameter types (closeEvent signature required by Qt)
+]
+"tests/test_*.py" = [
+    "PLC0415", "PLR2004",
+    "S101",   # Allow assert in tests
+    "S104",   # Allow 0.0.0.0 binding tests (security test scenarios)
+    "S311",   # Allow random (not security-critical in tests)
+    "S603", "S607",  # Test subprocess calls
+    "FBT001", "FBT002", "FBT003",  # Allow boolean args in test helpers
+    "ANN001", "ANN002", "ANN003", "ANN201", "ANN202",  # Type annotations not required in tests
+]
+"tests/conftest.py" = [
+    "ANN001", "ANN002", "ANN003", "ANN201", "ANN202",  # Type annotations not required in fixtures
+]
 
 [tool.ruff.lint.isort]
 known-first-party = ["linuxplay"]
@@ -131,9 +166,9 @@ docstring-code-line-length = 80
 
 [dependency-groups]
 dev = [
-    "ruff>=0.14.3",
+    "ruff>=0.14.4",
     "bandit>=1.8.6",
-    "pytest>=8.4.2",
+    "pytest>=9.0.0",
     "pytest-cov>=7.0.0",
     "pytest-mock>=3.11.0",
     "pytest-timeout>=2.1.0",

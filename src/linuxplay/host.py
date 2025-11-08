@@ -64,6 +64,9 @@ MIN_P_CORES_REQUIRED = 4  # Minimum P-cores for heterogeneous CPU detection
 MAX_P_CORES_FOR_ENCODING = 8  # Use up to 8 P-cores for encoding
 P_CORE_FREQ_THRESHOLD = 0.9  # P-cores are within 10% of max frequency
 
+# Mouse coordinate validation
+MAX_MOUSE_COORDINATE = 65535  # Maximum valid X11 coordinate (16-bit unsigned)
+
 # Auth and rate limiting
 AUTH_ROTATION_THRESHOLD = 3  # Failed attempts before forcing PIN rotation
 METRICS_LOG_INTERVAL_SECS = 60  # Log performance metrics every 60s
@@ -137,7 +140,7 @@ CA_KEY = "host_ca.key"
 TRUSTED_DB = "trusted_clients.json"
 
 
-def _ensure_ca():
+def _ensure_ca() -> bool | None:
     if not HAVE_CRYPTO:
         logging.warning("[AUTH] cryptography not available; certificate auth disabled.")
         return False
@@ -183,7 +186,7 @@ def _load_trust_db():
     return db
 
 
-def _save_trust_db(db):
+def _save_trust_db(db) -> bool | None:
     try:
         with Path(TRUSTED_DB).open("w", encoding="utf-8") as f:
             json.dump(db, f, indent=2)
@@ -423,7 +426,7 @@ except Exception:
 
 
 class HostState:
-    def __init__(self):
+    def __init__(self) -> None:
         self.video_threads = []
         self.session_active = False
         self.authed_client_ip = None
@@ -471,7 +474,7 @@ class HostState:
 host_state = HostState()
 
 
-def log_performance_metrics():
+def log_performance_metrics() -> None:
     """Log performance metrics at regular intervals for monitoring latency and health.
 
     Tracks:
@@ -611,7 +614,7 @@ def _vaapi_fmt_for_pix_fmt(pix_fmt: str, codec: str) -> str:
     return "nv12"
 
 
-def trigger_shutdown(reason: str):
+def trigger_shutdown(reason: str) -> None:
     with host_state.shutdown_lock:
         if host_state.should_terminate:
             return
@@ -634,7 +637,7 @@ def trigger_shutdown(reason: str):
         set_status(f"Stopping… ({reason})")
 
 
-def stop_all():
+def stop_all() -> None:
     host_state.should_terminate = True
 
     with host_state.video_thread_lock:
@@ -669,7 +672,7 @@ def stop_all():
     host_state.starting_streams = False
 
 
-def stop_streams_only():
+def stop_streams_only() -> None:
     with host_state.video_thread_lock:
         if host_state.video_threads:
             logging.info("Stopping active video streams...")
@@ -692,7 +695,7 @@ def stop_streams_only():
         logging.info("All streams stopped and cooldown set.")
 
 
-def cleanup():
+def cleanup() -> None:
     stop_all()
 
 
@@ -752,7 +755,7 @@ def _check_rate_limit(peer_ip: str) -> tuple[bool, str]:
         return (True, "")
 
 
-def _record_failed_auth(peer_ip: str):
+def _record_failed_auth(peer_ip: str) -> None:
     """Record a failed authentication attempt."""
     now = time.time()
 
@@ -843,7 +846,7 @@ def pin_rotate_if_needed(force: bool = False) -> None:
                 set_status(f"Waiting for PIN: {host_state.pin_code}")
 
 
-def pin_manager_thread():
+def pin_manager_thread() -> None:
     while not host_state.should_terminate:
         if not host_state.session_active:
             pin_rotate_if_needed()
@@ -862,7 +865,7 @@ FFMPEG_CACHE_TTL_SECS = 300
 CPU_CACHE_TTL_SECS = 3600
 
 
-def _clear_hw_cache():
+def _clear_hw_cache() -> None:
     """Clear hardware detection cache. Used in tests and when hardware changes."""
     _HW_CACHE.clear()
     _BITRATE_CACHE.clear()
@@ -1559,14 +1562,14 @@ def get_numa_node_for_gpu() -> int | None:
 
 
 class StreamThread(threading.Thread):
-    def __init__(self, cmd, name):
+    def __init__(self, cmd, name) -> None:
         super().__init__(daemon=True)
         self.cmd = cmd
         self.name = name
         self.process = None
         self._running = True
 
-    def _setup_cpu_affinity(self, ps):
+    def _setup_cpu_affinity(self, ps) -> None:
         """Configure CPU affinity and priority for the process."""
         ps.nice(-10)
         numa_node = get_numa_node_for_gpu()
@@ -1580,7 +1583,7 @@ class StreamThread(threading.Thread):
         else:
             logging.debug(f"{self.name} using default CPU affinity (no optimization)")
 
-    def _apply_numa_aware_affinity(self, ps, numa_node, affinity):
+    def _apply_numa_aware_affinity(self, ps, numa_node, affinity) -> None:
         """Apply NUMA-aware CPU affinity for optimal GPU locality."""
         try:
             numa_cores = [cpu for cpu in affinity if Path(f"/sys/devices/system/cpu/cpu{cpu}/node{numa_node}").exists()]
@@ -1598,7 +1601,7 @@ class StreamThread(threading.Thread):
             if affinity:
                 ps.cpu_affinity(affinity[:8])
 
-    def _log_startup_latency(self, start_time):
+    def _log_startup_latency(self, start_time) -> None:
         """Log encoder startup latency."""
         startup_latency = (time.time() - start_time) * 1000  # ms
         if startup_latency > ENCODER_STARTUP_THRESHOLD_MS:
@@ -1608,7 +1611,7 @@ class StreamThread(threading.Thread):
         else:
             logging.debug(f"{self.name} startup latency: {startup_latency:.1f}ms")
 
-    def run(self):
+    def run(self) -> None:
         start_time = time.time()
         logging.info("Starting %s: %s", self.name, " ".join(self.cmd))
         try:
@@ -1641,7 +1644,7 @@ class StreamThread(threading.Thread):
                 break
             time.sleep(0.2)
 
-    def stop(self):
+    def stop(self) -> None:
         """Stop FFmpeg process with proper cleanup to prevent zombies."""
         self._running = False
         if not self.process:
@@ -1668,7 +1671,148 @@ class StreamThread(threading.Thread):
             logging.error(f"Error stopping {self.name}: {e}")
 
 
+def detect_display_server() -> str:
+    """Detect if running on X11, Wayland, or unknown display server.
+
+    Returns:
+        str: 'wayland', 'x11', or 'unknown'
+    """
+    session_type = os.environ.get("XDG_SESSION_TYPE", "").lower()
+    if session_type == "wayland":
+        return "wayland"
+    if session_type == "x11":
+        return "x11"
+    # Fallback: check for DISPLAY (X11) or WAYLAND_DISPLAY
+    if os.environ.get("WAYLAND_DISPLAY"):
+        return "wayland"
+    if os.environ.get("DISPLAY"):
+        return "x11"
+    return "unknown"
+
+
+def _detect_monitors_wayland():  # noqa: PLR0912 - Complex detection logic for multiple Wayland compositors
+    """Detect monitors on Wayland using wlr-randr or swaymsg.
+
+    Returns:
+        list: List of tuples (width, height, offset_x, offset_y) or empty list on failure
+    """
+    # Try wlr-randr (works with wlroots compositors like Sway, Hyprland)
+    if which("wlr-randr"):
+        try:
+            out = subprocess.check_output(["wlr-randr"], universal_newlines=True, timeout=5, stderr=subprocess.DEVNULL)
+            mons = []
+            current_output = {}
+            for line in out.strip().splitlines():
+                stripped_line = line.strip()
+                # Output line format: "eDP-1 \"Some Manufacturer Some Model\" (focused)"
+                # Check if this is an output name line (not indented in original)
+                if line and not line[0].isspace() and "(" not in line[:20]:
+                    # New output detected, save previous if exists
+                    if current_output and "width" in current_output:
+                        mons.append(
+                            (
+                                current_output["width"],
+                                current_output["height"],
+                                current_output.get("x", 0),
+                                current_output.get("y", 0),
+                            )
+                        )
+                    current_output = {}
+                elif "current" in stripped_line.lower():
+                    # Parse line like "  1920x1080 px, 60.000000 Hz (preferred, current)"
+                    try:
+                        res_part = stripped_line.split()[0]
+                        if "x" in res_part:
+                            w, h = res_part.split("x")
+                            current_output["width"] = int(w)
+                            current_output["height"] = int(h)
+                    except (ValueError, IndexError):
+                        pass
+                elif "Position:" in stripped_line:
+                    # Parse line like "  Position: 0,0"
+                    try:
+                        pos = stripped_line.split("Position:")[1].strip().split(",")
+                        current_output["x"] = int(pos[0])
+                        current_output["y"] = int(pos[1])
+                    except (ValueError, IndexError):
+                        pass
+            # Add last output
+            if current_output and "width" in current_output:
+                mons.append(
+                    (
+                        current_output["width"],
+                        current_output["height"],
+                        current_output.get("x", 0),
+                        current_output.get("y", 0),
+                    )
+                )
+            if mons:
+                logging.info("Detected %d monitor(s) via wlr-randr on Wayland", len(mons))
+                return mons
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError) as e:
+            logging.debug("wlr-randr detection failed: %s", e)
+
+    # Try swaymsg (Sway-specific)
+    if which("swaymsg"):
+        try:
+            out = subprocess.check_output(["swaymsg", "-t", "get_outputs", "-r"], universal_newlines=True, timeout=5)
+            outputs = json.loads(out)
+            mons = []
+            for o in outputs:
+                if o.get("active"):
+                    rect = o.get("rect", {})
+                    w = rect.get("width", 0)
+                    h = rect.get("height", 0)
+                    x = rect.get("x", 0)
+                    y = rect.get("y", 0)
+                    if w > 0 and h > 0:
+                        mons.append((w, h, x, y))
+            if mons:
+                logging.info("Detected %d monitor(s) via swaymsg on Wayland", len(mons))
+                return mons
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError, json.JSONDecodeError) as e:
+            logging.debug("swaymsg detection failed: %s", e)
+
+    # Try hyprctl (Hyprland-specific)
+    if which("hyprctl"):
+        try:
+            out = subprocess.check_output(["hyprctl", "monitors", "-j"], universal_newlines=True, timeout=5)
+            monitors = json.loads(out)
+            mons = []
+            for m in monitors:
+                w = m.get("width", 0)
+                h = m.get("height", 0)
+                x = m.get("x", 0)
+                y = m.get("y", 0)
+                if w > 0 and h > 0:
+                    mons.append((w, h, x, y))
+            if mons:
+                logging.info("Detected %d monitor(s) via hyprctl on Wayland", len(mons))
+                return mons
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError, json.JSONDecodeError) as e:
+            logging.debug("hyprctl detection failed: %s", e)
+
+    logging.warning("No Wayland monitor detection tool found (tried wlr-randr, swaymsg, hyprctl)")
+    return []
+
+
 def _detect_monitors_linux():
+    """Detect monitors on Linux (X11 or Wayland).
+
+    Returns:
+        list: List of tuples (width, height, offset_x, offset_y) or empty list on failure
+    """
+    display_server = detect_display_server()
+    logging.info("Display server detected: %s", display_server)
+
+    # Try Wayland detection first if on Wayland
+    if display_server == "wayland":
+        mons = _detect_monitors_wayland()
+        if mons:
+            return mons
+        logging.warning("Wayland monitor detection failed, falling back to xrandr (may not work)")
+
+    # Try xrandr (X11)
     try:
         out = subprocess.check_output(
             ["xrandr", "--listmonitors"], universal_newlines=True, timeout=5, stderr=subprocess.DEVNULL
@@ -1693,10 +1837,12 @@ def _detect_monitors_linux():
                     break
                 except Exception:
                     continue
+    if mons:
+        logging.info("Detected %d monitor(s) via xrandr on X11", len(mons))
     return mons
 
 
-def detect_monitors():
+def detect_monitors() -> list:
     return _detect_monitors_linux()
 
 
@@ -2126,7 +2272,7 @@ def _pick_kms_device():
     return "/dev/dri/card0"
 
 
-def build_video_cmd(args, bitrate, monitor_info, video_port):
+def build_video_cmd(args, bitrate, monitor_info, video_port):  # noqa: PLR0912 - Complex video encoding logic
     try:
         fps_i = int(str(args.framerate))
     except Exception:
@@ -2164,9 +2310,24 @@ def build_video_cmd(args, bitrate, monitor_info, video_port):
     if "." not in disp:
         disp = f"{disp}.0"
 
+    # Detect display server for smarter capture selection
+    display_server = detect_display_server()
+    logging.info("Display server: %s", display_server)
+
     capture_pref = (os.environ.get("LINUXPLAY_CAPTURE", "auto") or "auto").lower()
     kms_available = ffmpeg_has_device("kmsgrab")
     vaapi_available = has_vaapi()
+
+    # On Wayland, prefer kmsgrab (x11grab won't work)
+    if display_server == "wayland" and capture_pref == "auto":
+        if kms_available:
+            logging.info("Wayland detected: forcing kmsgrab capture (x11grab incompatible)")
+            capture_pref = "kmsgrab"
+        else:
+            logging.warning(
+                "Wayland detected but kmsgrab unavailable. "
+                "Enable cap_sys_admin: sudo setcap cap_sys_admin+ep $(which ffmpeg)"
+            )
 
     def _vaapi_possible_for_codec():
         enc = (args.encoder or "h.264").lower()
@@ -2187,7 +2348,7 @@ def build_video_cmd(args, bitrate, monitor_info, video_port):
 
     if use_kms:
         kms_dev = os.environ.get("LINUXPLAY_KMS_DEVICE", _pick_kms_device())
-        logging.info("Linux capture: kmsgrab (%s) selected (pref=%s).", kms_dev, capture_pref)
+        logging.info("Linux capture: kmsgrab (%s) selected (pref=%s, works on X11/Wayland).", kms_dev, capture_pref)
         input_side = [
             *base_in,
             "-f",
@@ -2225,7 +2386,13 @@ def build_video_cmd(args, bitrate, monitor_info, video_port):
             extra_filters = ["-vf", f"hwdownload,format={pix_fmt or 'yuv420p'}"]
 
     else:
-        logging.info("Linux capture: x11grab selected (pref=%s, kms=%s).", capture_pref, kms_available)
+        if display_server == "wayland":
+            logging.warning(
+                "Linux capture: x11grab selected but Wayland detected! This will NOT work. "
+                "Enable kmsgrab: sudo setcap cap_sys_admin+ep $(which ffmpeg)"
+            )
+        else:
+            logging.info("Linux capture: x11grab selected (pref=%s, kms=%s, X11 mode).", capture_pref, kms_available)
         input_arg = f"{disp}+{ox},{oy}"
         input_side = [
             *base_in,
@@ -2412,7 +2579,7 @@ def build_audio_cmd():
     return input_side + output_side + encode + out
 
 
-def _inject_mouse_move(x, y):
+def _inject_mouse_move(x, y) -> None:
     if HAVE_PYNPUT:
         try:
             _mouse.position = (int(x), int(y))
@@ -2430,7 +2597,7 @@ def _inject_mouse_move(x, y):
             logging.debug(f"xdotool mousemove failed: {e}")
 
 
-def _inject_mouse_down(btn):
+def _inject_mouse_down(btn) -> None:
     if HAVE_PYNPUT:
         b = {"1": Button.left, "2": Button.middle, "3": Button.right}.get(btn, Button.left)
         try:
@@ -2445,7 +2612,7 @@ def _inject_mouse_down(btn):
             logging.debug(f"xdotool mousedown failed: {e}")
 
 
-def _inject_mouse_up(btn):
+def _inject_mouse_up(btn) -> None:
     if HAVE_PYNPUT:
         b = {"1": Button.left, "2": Button.middle, "3": Button.right}.get(btn, Button.left)
         try:
@@ -2460,7 +2627,7 @@ def _inject_mouse_up(btn):
             logging.debug(f"xdotool mouseup failed: {e}")
 
 
-def _inject_scroll(btn):
+def _inject_scroll(btn) -> None:
     if HAVE_PYNPUT:
         try:
             if btn == "4":
@@ -2588,7 +2755,7 @@ NAME_TO_CHAR = {
 }
 
 
-def _inject_key(action, name):
+def _inject_key(action, name) -> None:
     if HAVE_PYNPUT:
         k = _key_map.get(name)
         try:
@@ -2680,7 +2847,7 @@ def _activate_csr_session(peer_ip: str) -> str:
     return monitors_str
 
 
-def _handle_csr_auth(conn, peer_ip, parts, encoder_str):
+def _handle_csr_auth(conn, peer_ip, parts, encoder_str) -> bool | None:
     """Handle CSR-based authentication (secure mode)."""
     logging.info("[AUTH] New secure handshake with CSR from %s", peer_ip)
 
@@ -2726,7 +2893,7 @@ def _handle_csr_auth(conn, peer_ip, parts, encoder_str):
         return False
 
 
-def _handle_cert_challenge_auth(conn, peer_ip, parts, encoder_str):
+def _handle_cert_challenge_auth(conn, peer_ip, parts, encoder_str) -> bool | None:
     """Handle challenge-response authentication for existing cert."""
     fp_hex = parts[1][5:].strip().upper()
     logging.info("[AUTH] Challenge-response auth from %s (FP: %s...)", peer_ip, fp_hex[:12])
@@ -2809,7 +2976,7 @@ def _handle_cert_challenge_auth(conn, peer_ip, parts, encoder_str):
         return False
 
 
-def _handle_legacy_certfp_auth(conn, peer_ip, parts, encoder_str):
+def _handle_legacy_certfp_auth(conn, peer_ip, parts, encoder_str) -> bool:
     """Handle legacy fingerprint-only authentication (DEPRECATED)."""
     fp_hex = parts[1][len("CERTFP:") :].strip().upper()
     logging.warning("[AUTH] LEGACY fingerprint-only auth from %s (DEPRECATED)", peer_ip)
@@ -2843,7 +3010,8 @@ def _handle_legacy_certfp_auth(conn, peer_ip, parts, encoder_str):
             conn.sendall(resp.encode("utf-8"))
             conn.shutdown(socket.SHUT_WR)
             time.sleep(0.05)
-        finally:
+        except OSError:
+            # Socket already closed by client - expected during cleanup
             pass
 
         set_status(f"Client (legacy cert): {host_state.client_ip}")
@@ -2861,7 +3029,7 @@ def _handle_legacy_certfp_auth(conn, peer_ip, parts, encoder_str):
     return False
 
 
-def _handle_legacy_pin_auth(conn, peer_ip, parts, encoder_str):
+def _handle_legacy_pin_auth(conn, peer_ip, parts, encoder_str) -> bool:
     """Handle legacy PIN-only authentication (DEPRECATED)."""
     provided_pin = parts[1] if len(parts) >= HELLO_MIN_PARTS else ""
     logging.warning("[AUTH] LEGACY PIN-only auth from %s (DEPRECATED - insecure)", peer_ip)
@@ -2935,7 +3103,7 @@ def _handle_legacy_pin_auth(conn, peer_ip, parts, encoder_str):
     return False
 
 
-def tcp_handshake_server(sock, encoder_str, _args):
+def tcp_handshake_server(sock, encoder_str, _args) -> None:
     logging.info("TCP handshake server on %d", TCP_HANDSHAKE_PORT)
     set_status("Waiting for client handshake…")
 
@@ -3004,7 +3172,7 @@ def tcp_handshake_server(sock, encoder_str, _args):
             break
 
 
-def start_streams_for_current_client(args):
+def start_streams_for_current_client(args) -> None:
     ip = getattr(host_state, "client_ip", None)
     if not ip:
         logging.warning("start_streams_for_current_client: no valid client IP — waiting for handshake.")
@@ -3055,7 +3223,7 @@ def start_streams_for_current_client(args):
             host_state.starting_streams = False
 
 
-def _handle_net_mode_change(tokens):
+def _handle_net_mode_change(tokens) -> None:
     """Handle network mode change request."""
     if len(tokens) < HELLO_MIN_PARTS:
         return
@@ -3078,7 +3246,7 @@ def _handle_net_mode_change(tokens):
         logging.error(f"Restart after NET failed: {e}")
 
 
-def _handle_goodbye():
+def _handle_goodbye() -> None:
     """Handle client disconnect."""
     peer_ip = host_state.authed_client_ip or host_state.client_ip
     logging.info(f"Client at {peer_ip} disconnected cleanly.")
@@ -3099,8 +3267,16 @@ def _handle_goodbye():
         logging.error(f"Error handling GOODBYE cleanup: {e}")
 
 
-def _handle_mouse_packet(tokens):
-    """Handle mouse movement and button events."""
+def _handle_mouse_packet(tokens) -> None:
+    """Handle mouse movement and button events.
+
+    Args:
+        tokens: List of packet components [MOUSE_PKT, type, bmask, x, y]
+
+    Note:
+        Validates packet structure and coordinate bounds before injection.
+        Invalid packets are silently dropped to avoid DOS attacks.
+    """
     if len(tokens) != MOUSE_PKT_PARTS:
         return
 
@@ -3109,7 +3285,13 @@ def _handle_mouse_packet(tokens):
         bmask = int(tokens[2])
         x = int(tokens[3])
         y = int(tokens[4])
-    except ValueError:
+    except (ValueError, IndexError) as e:
+        logging.debug(f"Invalid mouse packet format: {e}")
+        return
+
+    # Validate coordinate bounds (prevent injection attacks)
+    if not (0 <= x <= MAX_MOUSE_COORDINATE and 0 <= y <= MAX_MOUSE_COORDINATE):
+        logging.warning(f"Mouse coordinates out of bounds: x={x}, y={y}")
         return
 
     _inject_mouse_move(x, y)
@@ -3130,7 +3312,7 @@ def _handle_mouse_packet(tokens):
             _inject_mouse_up("3")
 
 
-def _validate_control_packet(peer_ip):
+def _validate_control_packet(peer_ip) -> bool:
     """Validate if control packet should be processed. Returns True if valid."""
     if not host_state.session_active:
         logging.debug(f"Ignoring control packet from {peer_ip} (no active session)")
@@ -3147,28 +3329,41 @@ def _validate_control_packet(peer_ip):
     return True
 
 
-def _process_control_command(tokens):
-    """Process a control command from client."""
+def _process_control_command(tokens) -> None:
+    """Process a control command from client.
+
+    Args:
+        tokens: List of command tokens from client
+
+    Note:
+        Handles NET, GOODBYE, MOUSE_PKT, MOUSE_SCROLL, KEY_PRESS, KEY_RELEASE.
+        Invalid commands are silently ignored (already validated upstream).
+    """
     if not tokens:
         return
 
-    cmd = tokens[0].upper()
+    try:
+        cmd = tokens[0].upper()
 
-    if cmd == "NET":
-        _handle_net_mode_change(tokens)
-    elif cmd == "GOODBYE":
-        _handle_goodbye()
-    elif cmd == "MOUSE_PKT":
-        _handle_mouse_packet(tokens)
-    elif cmd == "MOUSE_SCROLL" and len(tokens) == PROTOCOL_CMD_AND_ARG:
-        _inject_scroll(tokens[1])
-    elif cmd == "KEY_PRESS" and len(tokens) == PROTOCOL_CMD_AND_ARG:
-        _inject_key("down", tokens[1])
-    elif cmd == "KEY_RELEASE" and len(tokens) == PROTOCOL_CMD_AND_ARG:
-        _inject_key("up", tokens[1])
+        if cmd == "NET":
+            _handle_net_mode_change(tokens)
+        elif cmd == "GOODBYE":
+            _handle_goodbye()
+        elif cmd == "MOUSE_PKT":
+            _handle_mouse_packet(tokens)
+        elif cmd == "MOUSE_SCROLL" and len(tokens) == PROTOCOL_CMD_AND_ARG:
+            _inject_scroll(tokens[1])
+        elif cmd == "KEY_PRESS" and len(tokens) == PROTOCOL_CMD_AND_ARG:
+            _inject_key("down", tokens[1])
+        elif cmd == "KEY_RELEASE" and len(tokens) == PROTOCOL_CMD_AND_ARG:
+            _inject_key("up", tokens[1])
+    except (IndexError, ValueError) as e:
+        logging.debug(f"Invalid control command format: {e}")
+    except Exception as e:
+        logging.error(f"Unexpected error processing control command: {e}")
 
 
-def control_listener(sock):
+def control_listener(sock) -> None:
     # Optimize socket for low-latency control input
     try:
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, UDP_RECV_BUFFER_SIZE)
@@ -3202,7 +3397,7 @@ def control_listener(sock):
             break
 
 
-def clipboard_monitor_host():
+def clipboard_monitor_host() -> None:
     if not HAVE_PYPERCLIP:
         logging.info("pyperclip not available; host clipboard sync disabled.")
         return
@@ -3240,7 +3435,7 @@ def clipboard_monitor_host():
     sock.close()
 
 
-def clipboard_listener_host(sock):
+def clipboard_listener_host(sock) -> None:
     if not HAVE_PYPERCLIP:
         return
 
@@ -3297,7 +3492,7 @@ def recvall(sock, n):
     return data
 
 
-def file_upload_listener():
+def file_upload_listener() -> None:
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     host_state.file_upload_sock = s
     try:
@@ -3372,7 +3567,7 @@ def file_upload_listener():
         host_state.file_upload_sock = None
 
 
-def _handle_heartbeat_timeout(now):
+def _handle_heartbeat_timeout(now) -> None:
     """Handle heartbeat timeout with exponential backoff."""
     timeout_count = host_state.perf_metrics.get("heartbeat_timeouts", 0)
     cooldown = min(
@@ -3459,7 +3654,7 @@ def _check_heartbeat_timeout(now, client_heartbeat_addr):
     return client_heartbeat_addr
 
 
-def heartbeat_manager(_args):
+def heartbeat_manager(_args) -> None:
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
         _optimize_udp_socket(s, send_buf=True, recv_buf=True)
@@ -3491,7 +3686,7 @@ def heartbeat_manager(_args):
             time.sleep(0.5)
 
 
-def resource_monitor():
+def resource_monitor() -> None:
     p = psutil.Process(os.getpid())
 
     def get_host_memory_mb():
@@ -3509,7 +3704,7 @@ def resource_monitor():
                     total += child.memory_info().rss
         return total / (1024 * 1024)
 
-    def read_gpu_usage():
+    def read_gpu_usage() -> str | None:
         if not HAVE_PYNVML:
             return None
         try:
@@ -3553,7 +3748,7 @@ def resource_monitor():
         time.sleep(5)
 
 
-def stats_broadcast():
+def stats_broadcast() -> None:
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     p = psutil.Process(os.getpid())
 
@@ -3607,7 +3802,7 @@ def stats_broadcast():
 
 
 class GamepadServer(threading.Thread):
-    def __init__(self):
+    def __init__(self) -> None:
         super().__init__(daemon=True)
         self._running = True
         self.sock = None
@@ -3673,7 +3868,7 @@ class GamepadServer(threading.Thread):
         ui.syn()
         return ui
 
-    def _process_dpad_event(self, c, v, pending):
+    def _process_dpad_event(self, c, v, pending) -> None:
         """Process D-pad key event and update HAT axes."""
         if c == ecodes.KEY_LEFT:
             self._dpad["left"] = v != 0
@@ -3702,7 +3897,7 @@ class GamepadServer(threading.Thread):
             self._haty = new_haty
             pending.append((ecodes.EV_ABS, ecodes.ABS_HAT0Y, self._haty))
 
-    def _process_gamepad_events(self, buf, n, pending):
+    def _process_gamepad_events(self, buf, n, pending) -> None:
         """Process gamepad events from buffer."""
         unpack_event = struct.Struct("!Bhh").unpack_from
 
@@ -3719,7 +3914,7 @@ class GamepadServer(threading.Thread):
             else:
                 pending.append((t, c, v))
 
-    def _receive_and_process_events(self, buf, pending):
+    def _receive_and_process_events(self, buf, pending) -> bool:
         """Receive and process gamepad events. Returns True to continue, False to break."""
         try:
             n, _ = self.sock.recvfrom_into(buf)
@@ -3746,7 +3941,7 @@ class GamepadServer(threading.Thread):
 
         return True
 
-    def run(self):
+    def run(self) -> None:
         with contextlib.suppress(Exception):
             psutil.Process(os.getpid()).nice(-10)
 
@@ -3781,7 +3976,7 @@ class GamepadServer(threading.Thread):
             # Socket cleanup failed - may already be closed
             logging.debug(f"Gamepad socket cleanup failed: {e}")
 
-    def stop(self):
+    def stop(self) -> None:
         self._running = False
         try:
             if self.sock:
@@ -3791,7 +3986,7 @@ class GamepadServer(threading.Thread):
             logging.debug(f"Gamepad socket stop failed: {e}")
 
 
-def session_manager(args):
+def session_manager(args) -> None:
     while not host_state.should_terminate:
         if time.time() - host_state.last_disconnect_ts < RECONNECT_COOLDOWN:
             time.sleep(0.1)
@@ -3803,7 +3998,7 @@ def session_manager(args):
         time.sleep(0.1)
 
 
-def _signal_handler(signum, _frame):
+def _signal_handler(signum, _frame) -> None:
     logging.info("Signal %s received, shutting down…", signum)
     trigger_shutdown(f"Signal {signum}")
     stop_all()
@@ -3844,7 +4039,7 @@ def _initialize_sockets(bind_address: str) -> bool:
     return True
 
 
-def _start_server_threads(args):
+def _start_server_threads(args) -> None:
     """Start all server threads."""
     threading.Thread(
         target=tcp_handshake_server,
@@ -3934,21 +4129,21 @@ def core_main(args, use_signals=True) -> int:
 class LogEmitter:
     """Thread-safe event emitter for log messages and status updates."""
 
-    def __init__(self):
+    def __init__(self) -> None:
         self.log_callbacks = []
         self.status_callbacks = []
 
-    def connect_log(self, callback):
+    def connect_log(self, callback) -> None:
         self.log_callbacks.append(callback)
 
-    def connect_status(self, callback):
+    def connect_status(self, callback) -> None:
         self.status_callbacks.append(callback)
 
-    def emit_log(self, msg: str):
+    def emit_log(self, msg: str) -> None:
         for callback in self.log_callbacks:
             callback(msg)
 
-    def emit_status(self, msg: str):
+    def emit_status(self, msg: str) -> None:
         for callback in self.status_callbacks:
             callback(msg)
 
@@ -3956,16 +4151,16 @@ class LogEmitter:
 log_emitter = LogEmitter()
 
 
-def set_status(text: str):
+def set_status(text: str) -> None:
     with contextlib.suppress(Exception):
         log_emitter.emit_status(text)
 
 
 class TkLogHandler(logging.Handler):
-    def __init__(self):
+    def __init__(self) -> None:
         super().__init__()
 
-    def emit(self, record):
+    def emit(self, record) -> None:
         try:
             msg = self.format(record)
         except Exception:
@@ -3974,7 +4169,7 @@ class TkLogHandler(logging.Handler):
             log_emitter.emit_log(msg)
 
 
-def _apply_dark_theme(root: tk.Tk):
+def _apply_dark_theme(root: tk.Tk) -> None:
     """Apply dark theme to tkinter window."""
     bg_dark = "#353535"
     fg_light = "#ffffff"
@@ -3990,7 +4185,7 @@ def _apply_dark_theme(root: tk.Tk):
 
 
 class HostWindow:
-    def __init__(self, root: tk.Tk, args):
+    def __init__(self, root: tk.Tk, args) -> None:
         self.root = root
         self.args = args
         self.core_thread = None
@@ -4044,16 +4239,16 @@ class HostWindow:
         # Handle window close
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
-    def _enable_stop_button(self):
+    def _enable_stop_button(self) -> None:
         self.stop_enabled = True
         self.stop_btn.config(state=tk.NORMAL)
 
-    def _start_core(self):
+    def _start_core(self) -> None:
         self.set_status_text("Starting…")
         self.append_log("Launching host core…")
         self.core_rc = None
 
-        def _run():
+        def _run() -> None:
             rc = core_main(self.args, use_signals=False)
             self.core_rc = rc
             self.root.after(0, lambda: self.root.quit())
@@ -4061,14 +4256,14 @@ class HostWindow:
         self.core_thread = threading.Thread(target=_run, name="HostCore", daemon=True)
         self.core_thread.start()
 
-    def _poll_core_done(self):
+    def _poll_core_done(self) -> None:
         """Poll for core termination and disable stop button if terminated."""
         if host_state.should_terminate:
             self.stop_btn.config(state=tk.DISABLED)
         else:
             self.root.after(300, self._poll_core_done)
 
-    def _on_stop(self):
+    def _on_stop(self) -> None:
         if not self.stop_enabled:
             return
         self.stop_btn.config(state=tk.DISABLED)
@@ -4076,10 +4271,10 @@ class HostWindow:
         self.append_log("Stop requested by user.")
         trigger_shutdown("User pressed Stop")
 
-    def append_log(self, text: str):
+    def append_log(self, text: str) -> None:
         """Thread-safe log append."""
 
-        def _append():
+        def _append() -> None:
             self.log_view.config(state=tk.NORMAL)
             self.log_view.insert(tk.END, text + "\n")
             self.log_view.see(tk.END)
@@ -4091,10 +4286,10 @@ class HostWindow:
         else:
             self.root.after(0, _append)
 
-    def set_status_text(self, text: str):
+    def set_status_text(self, text: str) -> None:
         """Thread-safe status update."""
 
-        def _update():
+        def _update() -> None:
             self.status_label.config(text=text)
 
         if threading.current_thread() is threading.main_thread():
@@ -4102,7 +4297,7 @@ class HostWindow:
         else:
             self.root.after(0, _update)
 
-    def _on_close(self):
+    def _on_close(self) -> None:
         if not host_state.should_terminate:
             trigger_shutdown("Window closed")
         self.root.destroy()
@@ -4146,7 +4341,7 @@ def parse_args():
     return p.parse_args()
 
 
-def _print_hardware_section(title, data, format_func):
+def _print_hardware_section(title, data, format_func) -> None:
     """Print a section of the hardware report."""
     if not data:
         return
@@ -4155,14 +4350,14 @@ def _print_hardware_section(title, data, format_func):
     print()
 
 
-def _format_platform_info(report):
+def _format_platform_info(report) -> None:
     """Format platform information."""
     print(f"  OS: {report['platform']['os']}")
     print(f"  Architecture: {report['platform']['arch']}")
     print(f"  Linux: {report['platform']['is_linux']}")
 
 
-def _format_cpu_info(cpu):
+def _format_cpu_info(cpu) -> None:
     """Format CPU information."""
     print(f"  Logical cores: {cpu.get('logical_cores', 'N/A')}")
     print(f"  Physical cores: {cpu.get('physical_cores', 'N/A')}")
@@ -4176,7 +4371,7 @@ def _format_cpu_info(cpu):
         print("  Heterogeneous: No")
 
 
-def _format_gpu_info(gpu):
+def _format_gpu_info(gpu) -> None:
     """Format GPU information."""
     print(f"  NVIDIA: {gpu.get('nvidia', False)}")
     if gpu.get("nvidia_model"):
@@ -4184,19 +4379,19 @@ def _format_gpu_info(gpu):
     print(f"  VAAPI available: {gpu.get('vaapi_available', False)}")
 
 
-def _format_numa_info(numa):
+def _format_numa_info(numa) -> None:
     """Format NUMA information."""
     print(f"  Multi-socket system: {numa.get('multi_socket', False)}")
     if numa.get("gpu_node") is not None:
         print(f"  GPU NUMA node: {numa['gpu_node']}")
 
 
-def _format_accelerators_info(accelerators):
+def _format_accelerators_info(accelerators) -> None:
     """Format hardware accelerators information."""
     print(f"  FFmpeg hwaccels: {', '.join(sorted(accelerators)) or 'none'}")
 
 
-def _format_encoders_info(encoders):
+def _format_encoders_info(encoders) -> None:
     """Format encoders information."""
     for name, info in sorted(encoders.items()):
         status = "✓ Available" if info["available"] else "✗ Not available"
@@ -4205,13 +4400,13 @@ def _format_encoders_info(encoders):
         print(f"  {name:20s}: {status}")
 
 
-def _format_affinity_info(affinity):
+def _format_affinity_info(affinity) -> None:
     """Format CPU affinity information."""
     print(f"  Recommended cores: {affinity}")
     print("  (Physical cores for lowest latency streaming)")
 
 
-def _format_warnings_info(warnings):
+def _format_warnings_info(warnings) -> None:
     """Format warnings and recommendations."""
     import textwrap
 
@@ -4220,7 +4415,7 @@ def _format_warnings_info(warnings):
         print(f"  {i}. {wrapped}")
 
 
-def _print_hardware_report(report):
+def _print_hardware_report(report) -> None:
     """Print the complete hardware report."""
     print("\n" + "=" * 70)
     print("LinuxPlay Hardware Detection Report")
@@ -4238,7 +4433,7 @@ def _print_hardware_report(report):
     print("=" * 70 + "\n")
 
 
-def main():
+def main() -> int | None:
     args = parse_args()
 
     logging.basicConfig(
